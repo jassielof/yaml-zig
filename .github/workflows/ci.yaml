@@ -22,8 +22,8 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
 
-      - name: Check formatting
-        run: zig fmt src/ tests/ --check
+      - name: Formatting
+        run: zig fmt --color on src/ tests/ build.zig build.zig.zon
 
       - name: Build
         run: zig build --summary all -Doptimize=ReleaseSafe
@@ -31,7 +31,7 @@ jobs:
       - name: Tests
         run: zig build --summary all tests -Doptimize=ReleaseSafe
 
-      - name: Build docs
+      - name: Docs
         run: zig build --summary all docs
 
       - name: Upload artifact
