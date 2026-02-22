@@ -24,6 +24,11 @@ pub fn init(allocator: std.mem.Allocator, scanned: Scanner.ScannedDocument, opti
 
 /// Release parser-owned allocations.
 pub fn deinit(self: *Parser) void {
+    for (self.events.items) |ev| {
+        if (ev.kind == .scalar) {
+            self.allocator.free(ev.data.scalar.value);
+        }
+    }
     self.events.deinit(self.allocator);
     self.scanned.deinit(self.allocator);
     self.* = undefined;
