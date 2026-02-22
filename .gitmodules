@@ -1,0 +1,12 @@
+[submodule "modules/libfyaml"]
+	path = modules/libfyaml
+	url = https://github.com/pantoniou/libfyaml
+[submodule "modules/zig-yaml"]
+	path = modules/zig-yaml
+	url = https://github.com/kubkon/zig-yaml
+[submodule "modules/ymlz"]
+	path = modules/ymlz
+	url = https://github.com/pwbh/ymlz
+[submodule "tests/fixtures"]
+	path = tests/fixtures
+	url = https://github.com/yaml/yaml-test-suite
