@@ -1,7 +1,6 @@
-//! YAML parser and serializer library for Zig 0.15.2.
+//! YAML parser and serializer.
 //!
-//! This module exposes the public API. Internal implementation is split across
-//! focused files to keep each component understandable and maintainable.
+//! This module exposes the public API. Internal implementation is split across focused files to keep each component understandable and maintainable.
 const std = @import("std");
 
 pub const Mark = @import("Mark.zig");
