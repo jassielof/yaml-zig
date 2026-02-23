@@ -6,7 +6,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const lib_mod = b.addModule("yaml", .{
+    const lib_mod = b.addModule(mod_name, .{
         .root_source_file = b.path("src/lib/root.zig"),
         .target = target,
         .optimize = optimize,
