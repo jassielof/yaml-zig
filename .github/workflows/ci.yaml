@@ -37,6 +37,7 @@ jobs:
           path: zig-out/docs
   tests:
     strategy:
+      fail-fast: false
       matrix:
         os:
           - ubuntu-latest
@@ -55,6 +56,18 @@ jobs:
 
       - name: Tests
         run: zig build --summary all tests -Doptimize=ReleaseSafe
+
+      - name: Setup Python
+        if: always()
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+
+      - name: Render YAML spec coverage summary
+        if: always()
+        env:
+          MATRIX_OS: ${{ matrix.os }}
+        run: python scripts/render_coverage_summary.py
 
   pages:
     environment:
