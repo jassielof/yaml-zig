@@ -1,6 +1,3 @@
-[submodule "modules/libfyaml"]
-	path = modules/libfyaml
-	url = https://github.com/pantoniou/libfyaml
 [submodule "modules/zig-yaml"]
 	path = modules/zig-yaml
 	url = https://github.com/kubkon/zig-yaml
