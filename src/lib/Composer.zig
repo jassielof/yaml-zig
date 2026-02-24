@@ -20,13 +20,23 @@ pub fn compose(
 ) !Document {
     defer freeEvents(allocator, events);
 
+    var anchors: std.StringHashMapUnmanaged(Node) = .{};
+    defer {
+        var it = anchors.iterator();
+        while (it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(allocator);
+        }
+        anchors.deinit(allocator);
+    }
+
     if (events.len < 4) return Error.Parse.UnexpectedToken;
     if (events[0].kind != .stream_start or events[1].kind != .document_start) {
         return Error.Parse.UnexpectedToken;
     }
 
     var index: usize = 2;
-    const root = try composeNode(allocator, events, &index, options);
+    const root = try composeNode(allocator, events, &index, options, &anchors);
 
     if (index >= events.len or events[index].kind != .document_end) {
         var owned_root = root;
@@ -48,18 +58,25 @@ fn composeNode(
     events: []Event,
     index: *usize,
     options: Options.Parse,
+    anchors: *std.StringHashMapUnmanaged(Node),
 ) !Node {
     if (index.* >= events.len) return Error.Parse.UnexpectedToken;
     const ev = events[index.*];
     switch (ev.kind) {
         .scalar => {
             index.* += 1;
-            return Schema.resolveScalar(
+            const resolved = try Schema.resolveScalar(
                 allocator,
                 ev.data.scalar.value,
                 ev.data.scalar.style,
                 options.resolve_core_schema,
             );
+
+            if (ev.data.scalar.anchor) |anchor_name| {
+                try putAnchor(allocator, anchors, anchor_name, resolved);
+            }
+
+            return resolved;
         },
         .sequence_start => {
             index.* += 1;
@@ -70,7 +87,7 @@ fn composeNode(
             }
 
             while (index.* < events.len and events[index.*].kind != .sequence_end) {
-                try seq.append(allocator, try composeNode(allocator, events, index, options));
+                try seq.append(allocator, try composeNode(allocator, events, index, options, anchors));
             }
             if (index.* >= events.len or events[index.*].kind != .sequence_end) return Error.Parse.UnexpectedToken;
             index.* += 1;
@@ -88,16 +105,23 @@ fn composeNode(
             }
 
             while (index.* < events.len and events[index.*].kind != .mapping_end) {
-                if (events[index.*].kind != .scalar) return Error.Parse.InvalidMappingKey;
-                const key = try allocator.dupe(u8, events[index.*].data.scalar.value);
+                const key = switch (events[index.*].kind) {
+                    .scalar => try allocator.dupe(u8, events[index.*].data.scalar.value),
+                    .alias => blk: {
+                        const alias_name = events[index.*].data.alias.name;
+                        const aliased = anchors.get(alias_name) orelse return Error.Parse.InvalidAlias;
+                        break :blk try nodeToKeyString(allocator, aliased);
+                    },
+                    else => return Error.Parse.InvalidMappingKey,
+                };
+                errdefer allocator.free(key);
                 index.* += 1;
-                var value = try composeNode(allocator, events, index, options);
+                var value = try composeNode(allocator, events, index, options, anchors);
+                errdefer value.deinit(allocator);
 
                 if (findMapKey(map.items, key)) |existing_idx| {
                     switch (options.duplicate_keys) {
                         .reject => {
-                            allocator.free(key);
-                            value.deinit(allocator);
                             return Error.Parse.DuplicateKey;
                         },
                         .keep_last => {
@@ -115,7 +139,12 @@ fn composeNode(
             index.* += 1;
             return .{ .mapping = map };
         },
-        .alias => return Error.Parse.UnsupportedFeature,
+        .alias => {
+            const alias_name = ev.data.alias.name;
+            const aliased = anchors.get(alias_name) orelse return Error.Parse.InvalidAlias;
+            index.* += 1;
+            return aliased.clone(allocator);
+        },
         else => return Error.Parse.UnexpectedToken,
     }
 }
@@ -123,11 +152,41 @@ fn composeNode(
 fn freeEvents(allocator: std.mem.Allocator, events: []Event) void {
     for (events) |ev| {
         switch (ev.kind) {
-            .scalar => allocator.free(ev.data.scalar.value),
+            .scalar => {
+                allocator.free(ev.data.scalar.value);
+                if (ev.data.scalar.anchor) |anchor| allocator.free(anchor);
+            },
+            .alias => allocator.free(ev.data.alias.name),
             else => {},
         }
     }
     allocator.free(events);
+}
+
+fn putAnchor(
+    allocator: std.mem.Allocator,
+    anchors: *std.StringHashMapUnmanaged(Node),
+    name: []const u8,
+    value: Node,
+) !void {
+    if (anchors.getEntry(name)) |entry| {
+        entry.value_ptr.deinit(allocator);
+        entry.value_ptr.* = try value.clone(allocator);
+        return;
+    }
+
+    try anchors.put(allocator, try allocator.dupe(u8, name), try value.clone(allocator));
+}
+
+fn nodeToKeyString(allocator: std.mem.Allocator, node: Node) ![]u8 {
+    return switch (node) {
+        .null => try allocator.dupe(u8, "null"),
+        .bool => |v| try allocator.dupe(u8, if (v) "true" else "false"),
+        .int => |v| try std.fmt.allocPrint(allocator, "{d}", .{v}),
+        .float => |v| try std.fmt.allocPrint(allocator, "{d}", .{v}),
+        .string => |v| try allocator.dupe(u8, v),
+        else => Error.Parse.InvalidMappingKey,
+    };
 }
 
 fn findMapKey(items: []const MapEntry, key: []const u8) ?usize {

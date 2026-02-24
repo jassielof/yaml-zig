@@ -30,6 +30,7 @@ pub const MappingStart = struct {
 pub const Scalar = struct {
     value: []const u8,
     style: Token.ScalarStyle = .plain,
+    anchor: ?[]const u8 = null,
     span: Span = .{},
 };
 

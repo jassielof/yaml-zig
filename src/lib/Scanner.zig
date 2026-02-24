@@ -63,13 +63,23 @@ pub fn scan(self: *Scanner) !ScannedDocument {
     while (split.next()) |raw_line| : (line_no += 1) {
         const line = stripCarriageReturn(raw_line);
         const indent = try countIndent(line);
-        const content = stripInlineComment(std.mem.trimLeft(u8, line[indent..], " "));
+        var content = stripInlineComment(std.mem.trimLeft(u8, line[indent..], " "));
         if (content.len == 0 or std.mem.startsWith(u8, content, "#")) continue;
         if (std.mem.startsWith(u8, content, "%")) continue;
-        if (std.mem.eql(u8, content, "---") or std.mem.eql(u8, content, "...")) continue;
+        if (std.mem.startsWith(u8, content, "---") and (content.len == 3 or content[3] == ' ' or content[3] == '\t')) {
+            content = std.mem.trimLeft(u8, content[3..], " \t");
+            if (content.len == 0) continue;
+        }
+        if (std.mem.startsWith(u8, content, "...")) {
+            const after = std.mem.trim(u8, content[3..], " \t");
+            if (after.len == 0) continue;
+        }
 
-        if (std.mem.startsWith(u8, content, "- ")) {
-            const sequence_value = stripInlineComment(std.mem.trimLeft(u8, content[2..], " "));
+        if (content[0] == '-' and (content.len == 1 or content[1] == ' ' or content[1] == '\t')) {
+            const sequence_value = if (content.len == 1)
+                ""
+            else
+                stripInlineComment(std.mem.trimLeft(u8, content[2..], " "));
             try self.lines.append(self.allocator, .{
                 .line_no = line_no,
                 .indent = indent,
