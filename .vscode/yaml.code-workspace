@@ -1,0 +1,12 @@
+{
+  "folders": [
+    {
+      "path": "../",
+      "name": "YAML",
+    },
+    {
+      "path": "../modules/fangz",
+      "name": "Fangz",
+    },
+  ],
+}
