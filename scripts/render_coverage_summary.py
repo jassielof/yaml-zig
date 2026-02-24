@@ -11,11 +11,21 @@ def append_summary(lines: list[str]) -> None:
         summary_file.write("\n".join(lines) + "\n")
 
 
+def format_id_list(ids: list[str], limit: int = 120) -> list[str]:
+    if not ids:
+        return ["_none_"]
+    items = [f"`{fid}`" for fid in ids[:limit]]
+    result = [", ".join(items)]
+    if len(ids) > limit:
+        result.append(f"… and {len(ids) - limit} more")
+    return result
+
+
 def main() -> int:
     matrix_os = os.environ.get("MATRIX_OS", "unknown-os")
     report_path = Path("zig-out/spec-coverage/coverage.json")
 
-    lines: list[str] = [f"## YAML Spec Coverage ({matrix_os})", ""]
+    lines: list[str] = [f"### YAML Spec Coverage — `{matrix_os}`", ""]
 
     if not report_path.exists():
         lines.append("Coverage report was not generated.")
@@ -33,31 +43,24 @@ def main() -> int:
 
     lines.extend(
         [
-            f"- coverage: **{coverage:.2f}%**",
-            f"- passed: {passed} / {total}",
-            f"- unsupported: {unsupported}",
-            f"- failed: {failed}",
+            f"> **{passed}/{total} ({coverage:.2f}%)**",
             "",
-            "### Failed fixture IDs",
+            "| Passed | Failed | Unsupported |",
+            "|-------:|-------:|------------:|",
+            f"| {passed}/{total} ({coverage:.2f}%) | {failed} | {unsupported} |",
+            "",
         ]
     )
 
-    if not failed_ids:
-        lines.append("- none")
-    else:
-        for fixture_id in failed_ids[:80]:
-            lines.append(f"- {fixture_id}")
-        if len(failed_ids) > 80:
-            lines.append(f"- ... and {len(failed_ids) - 80} more")
+    lines.append("<details><summary>Failed fixture IDs</summary>")
+    lines.append("")
+    lines.extend(format_id_list(failed_ids))
+    lines.extend(["", "</details>", ""])
 
-    lines.extend(["", "### Unsupported fixture IDs"])
-    if not unsupported_ids:
-        lines.append("- none")
-    else:
-        for fixture_id in unsupported_ids[:80]:
-            lines.append(f"- {fixture_id}")
-        if len(unsupported_ids) > 80:
-            lines.append(f"- ... and {len(unsupported_ids) - 80} more")
+    lines.append("<details><summary>Unsupported fixture IDs</summary>")
+    lines.append("")
+    lines.extend(format_id_list(unsupported_ids))
+    lines.extend(["", "</details>"])
 
     append_summary(lines)
     return 0
