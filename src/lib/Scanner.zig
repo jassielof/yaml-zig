@@ -17,6 +17,7 @@ pub const ScannedLine = struct {
     indent: usize,
     kind: LineKind,
     key: []const u8 = "",
+    key_style: TokenModel.ScalarStyle = .plain,
     value: []const u8 = "",
     style: TokenModel.ScalarStyle = .plain,
     span: Span = .{},
@@ -64,6 +65,8 @@ pub fn scan(self: *Scanner) !ScannedDocument {
         const indent = try countIndent(line);
         const content = stripInlineComment(std.mem.trimLeft(u8, line[indent..], " "));
         if (content.len == 0 or std.mem.startsWith(u8, content, "#")) continue;
+        if (std.mem.startsWith(u8, content, "%")) continue;
+        if (std.mem.eql(u8, content, "---") or std.mem.eql(u8, content, "...")) continue;
 
         if (std.mem.startsWith(u8, content, "- ")) {
             const sequence_value = stripInlineComment(std.mem.trimLeft(u8, content[2..], " "));
@@ -87,6 +90,7 @@ pub fn scan(self: *Scanner) !ScannedDocument {
                 .indent = indent,
                 .kind = .mapping_entry,
                 .key = key,
+                .key_style = detectStyle(key),
                 .value = value,
                 .style = detectStyle(value),
                 .span = makeSpan(line_no, indent, line.len),
@@ -224,8 +228,8 @@ fn detectStyle(value: []const u8) TokenModel.ScalarStyle {
     if (value.len == 0) return .plain;
     if (value[0] == '\'') return .single_quoted;
     if (value[0] == '"') return .double_quoted;
-    if (std.mem.eql(u8, value, "|")) return .literal;
-    if (std.mem.eql(u8, value, ">")) return .folded;
+    if (value[0] == '|') return .literal;
+    if (value[0] == '>') return .folded;
     return .plain;
 }
 

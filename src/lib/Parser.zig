@@ -115,7 +115,9 @@ fn parseBlockMapping(self: *Parser, indent: usize) anyerror!void {
         const line = self.scanned.lines.items[self.index];
         if (line.indent != indent or line.kind != .mapping_entry) break;
 
-        try self.pushScalar(line.key, .plain, line.span);
+        const normalized_key = try normalizeScalar(self.allocator, line.key, line.key_style);
+        defer self.allocator.free(normalized_key);
+        try self.pushScalar(normalized_key, .plain, line.span);
         if (line.value.len == 0) {
             self.index += 1;
             if (self.index < self.scanned.lines.items.len and self.scanned.lines.items[self.index].indent > indent) {
@@ -168,20 +170,32 @@ fn parseScalarLikeValue(
     line_no: usize,
     col: usize,
 ) anyerror!void {
-    if (value.len == 0) {
+    var working = std.mem.trim(u8, value, " ");
+    var working_style = style;
+
+    if (working_style == .plain) {
+        working = stripTagPrefix(working);
+        const unanchored = stripAnchorPrefix(working);
+        if (unanchored.len != working.len) {
+            working = unanchored;
+        }
+        working_style = detectInlineStyle(working);
+    }
+
+    if (working.len == 0) {
         try self.pushScalar("null", .plain, .{});
         return;
     }
 
-    if (value[0] == '[' or value[0] == '{') {
-        try self.parseFlow(value, line_no, col);
+    if (working[0] == '[' or working[0] == '{') {
+        try self.parseFlow(working, line_no, col);
         return;
     }
 
-    if (style == .plain) {
-        if (Scanner.findInlineMappingColon(value)) |idx| {
-            const key = std.mem.trimRight(u8, value[0..idx], " ");
-            const raw_val = std.mem.trimLeft(u8, value[idx + 1 ..], " ");
+    if (working_style == .plain) {
+        if (Scanner.findInlineMappingColon(working)) |idx| {
+            const key = std.mem.trimRight(u8, working[0..idx], " ");
+            const raw_val = std.mem.trimLeft(u8, working[idx + 1 ..], " ");
             if (key.len > 0) {
                 try self.events.append(self.allocator, .{
                     .kind = .mapping_start,
@@ -195,9 +209,9 @@ fn parseScalarLikeValue(
         }
     }
 
-    const scalar = try normalizeScalar(self.allocator, value, style);
+    const scalar = try normalizeScalar(self.allocator, working, working_style);
     defer self.allocator.free(scalar);
-    try self.pushScalar(scalar, style, .{});
+    try self.pushScalar(scalar, working_style, .{});
 }
 
 fn detectInlineStyle(value: []const u8) Token.ScalarStyle {
@@ -244,9 +258,13 @@ fn parseFlowValue(self: *Parser, tokens: []const Token.Token, cursor: *usize) an
                 if (key.kind != .scalar) return Error.Parse.UnexpectedToken;
                 try self.pushScalar(key.lexeme, key.scalar_style, key.span);
                 cursor.* += 1;
-                if (tokens[cursor.*].kind != .colon) return Error.Parse.UnexpectedToken;
-                cursor.* += 1;
-                try self.parseFlowValue(tokens, cursor);
+                if (cursor.* >= tokens.len) return Error.Parse.UnexpectedToken;
+                if (tokens[cursor.*].kind == .colon) {
+                    cursor.* += 1;
+                    try self.parseFlowValue(tokens, cursor);
+                } else {
+                    try self.pushScalar("null", .plain, key.span);
+                }
                 if (tokens[cursor.*].kind == .comma) cursor.* += 1;
             }
             if (cursor.* >= tokens.len or tokens[cursor.*].kind != .rbrace) return Error.Parse.UnterminatedFlowCollection;
@@ -319,6 +337,43 @@ fn stripOuterQuotes(raw: []const u8, quote: u8) []const u8 {
         return raw[1 .. raw.len - 1];
     }
     return raw;
+}
+
+fn stripTagPrefix(raw: []const u8) []const u8 {
+    var value = std.mem.trimLeft(u8, raw, " ");
+    while (value.len > 1 and value[0] == '!' and !std.mem.startsWith(u8, value, "!=") and !std.mem.startsWith(u8, value, "!=")) {
+        var i: usize = 1;
+        if (i < value.len and value[i] == '<') {
+            i += 1;
+            while (i < value.len and value[i] != '>') : (i += 1) {}
+            if (i < value.len and value[i] == '>') i += 1;
+        } else {
+            while (i < value.len and !isSpace(value[i])) : (i += 1) {}
+        }
+        value = std.mem.trimLeft(u8, value[i..], " ");
+    }
+    return value;
+}
+
+fn stripAnchorPrefix(raw: []const u8) []const u8 {
+    var value = std.mem.trimLeft(u8, raw, " ");
+    while (value.len > 1 and value[0] == '&') {
+        var i: usize = 1;
+        while (i < value.len and isNameChar(value[i])) : (i += 1) {}
+        value = std.mem.trimLeft(u8, value[i..], " ");
+    }
+    return value;
+}
+
+fn isSpace(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\n' or c == '\r';
+}
+
+fn isNameChar(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or
+        (c >= 'A' and c <= 'Z') or
+        (c >= '0' and c <= '9') or
+        c == '_' or c == '-';
 }
 
 fn pushScalar(self: *Parser, value: []const u8, style: Token.ScalarStyle, span: @import("Span.zig")) anyerror!void {
