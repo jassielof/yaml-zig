@@ -10,3 +10,6 @@
 [submodule "modules/fangz"]
 	path = modules/fangz
 	url = https://github.com/jassielof/fangz
+[submodule "modules/libfyaml"]
+	path = modules/libfyaml
+	url = https://github.com/pantoniou/libfyaml
