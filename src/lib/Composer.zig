@@ -79,6 +79,7 @@ fn composeNode(
             return resolved;
         },
         .sequence_start => {
+            const seq_anchor = ev.data.sequence_start.anchor;
             index.* += 1;
             var seq: std.ArrayListUnmanaged(Node) = .{};
             errdefer {
@@ -91,9 +92,14 @@ fn composeNode(
             }
             if (index.* >= events.len or events[index.*].kind != .sequence_end) return Error.Parse.UnexpectedToken;
             index.* += 1;
-            return .{ .sequence = seq };
+            const result: Node = .{ .sequence = seq };
+            if (seq_anchor) |anchor_name| {
+                try putAnchor(allocator, anchors, anchor_name, result);
+            }
+            return result;
         },
         .mapping_start => {
+            const map_anchor = ev.data.mapping_start.anchor;
             index.* += 1;
             var map: std.ArrayListUnmanaged(MapEntry) = .{};
             errdefer {
@@ -137,7 +143,11 @@ fn composeNode(
             }
             if (index.* >= events.len or events[index.*].kind != .mapping_end) return Error.Parse.UnexpectedToken;
             index.* += 1;
-            return .{ .mapping = map };
+            const result: Node = .{ .mapping = map };
+            if (map_anchor) |anchor_name| {
+                try putAnchor(allocator, anchors, anchor_name, result);
+            }
+            return result;
         },
         .alias => {
             const alias_name = ev.data.alias.name;
@@ -157,6 +167,8 @@ fn freeEvents(allocator: std.mem.Allocator, events: []Event) void {
                 if (ev.data.scalar.anchor) |anchor| allocator.free(anchor);
             },
             .alias => allocator.free(ev.data.alias.name),
+            .sequence_start => if (ev.data.sequence_start.anchor) |a| allocator.free(a),
+            .mapping_start => if (ev.data.mapping_start.anchor) |a| allocator.free(a),
             else => {},
         }
     }

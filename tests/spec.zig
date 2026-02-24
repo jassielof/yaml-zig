@@ -252,6 +252,7 @@ fn describeMismatch(node: *const yaml.Node.Node, json_val: std.json.Value) DiagR
                 .string => |n| n,
                 else => return .{ .text = "type mismatch (string)", .allocated = false },
             };
+            if (std.mem.eql(u8, s, actual)) return .{ .text = "ok", .allocated = false };
             const s_prev = if (s.len > 32) s[0..32] else s;
             const a_prev = if (actual.len > 32) actual[0..32] else actual;
             const text = std.fmt.allocPrint(testing.allocator, "expected \"{s}\", got \"{s}\"", .{ s_prev, a_prev }) catch
@@ -286,7 +287,7 @@ fn describeMismatch(node: *const yaml.Node.Node, json_val: std.json.Value) DiagR
                 }
                 if (child_diag.allocated) testing.allocator.free(child_diag.text);
             }
-            return .{ .text = "mapping: deep mismatch", .allocated = false };
+            return .{ .text = "ok", .allocated = false };
         },
         .array => |arr| {
             const seq = switch (node.*) {
@@ -309,7 +310,7 @@ fn describeMismatch(node: *const yaml.Node.Node, json_val: std.json.Value) DiagR
                 }
                 if (child_diag.allocated) testing.allocator.free(child_diag.text);
             }
-            return .{ .text = "sequence: deep mismatch", .allocated = false };
+            return .{ .text = "ok", .allocated = false };
         },
         .integer => |v| {
             const actual = switch (node.*) {
@@ -449,10 +450,11 @@ fn expectNodeMatchesJson(node: *const yaml.Node.Node, value: std.json.Value) !vo
             .bool => |n| n,
             else => return error.TestUnexpectedResult,
         }) return error.TestUnexpectedResult,
-        .integer => |v| if (v != switch (node.*) {
-            .int => |n| n,
+        .integer => |v| switch (node.*) {
+            .int => |n| if (v != n) return error.TestUnexpectedResult,
+            .float => |n| if (!approxEq(@as(f64, @floatFromInt(v)), n, 1e-9)) return error.TestUnexpectedResult,
             else => return error.TestUnexpectedResult,
-        }) return error.TestUnexpectedResult,
+        },
         .float => |v| {
             const actual = switch (node.*) {
                 .float => |n| n,

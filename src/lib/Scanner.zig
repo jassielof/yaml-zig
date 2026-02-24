@@ -27,7 +27,6 @@ pub const ScannedDocument = struct {
     source: []const u8,
     lines: std.ArrayListUnmanaged(ScannedLine),
 
-    /// Release scanner-owned line metadata.
     pub fn deinit(self: *ScannedDocument, allocator: std.mem.Allocator) void {
         self.lines.deinit(allocator);
         self.* = undefined;
@@ -49,24 +48,24 @@ pub fn init(allocator: std.mem.Allocator, source: []const u8, options: Options.P
     };
 }
 
-/// Release scanner internal allocations.
 pub fn deinit(self: *Scanner) void {
     self.lines.deinit(self.allocator);
     self.* = undefined;
 }
 
-/// Scan source text into line records for parser consumption.
 pub fn scan(self: *Scanner) !ScannedDocument {
     var split = std.mem.splitScalar(u8, self.source, '\n');
     var line_no: usize = 0;
+    var past_doc_start = false;
 
     while (split.next()) |raw_line| : (line_no += 1) {
         const line = stripCarriageReturn(raw_line);
         const indent = try countIndent(line);
         var content = stripInlineComment(std.mem.trimLeft(u8, line[indent..], " "));
         if (content.len == 0 or std.mem.startsWith(u8, content, "#")) continue;
-        if (std.mem.startsWith(u8, content, "%")) continue;
+        if (!past_doc_start and content[0] == '%') continue;
         if (std.mem.startsWith(u8, content, "---") and (content.len == 3 or content[3] == ' ' or content[3] == '\t')) {
+            past_doc_start = true;
             content = std.mem.trimLeft(u8, content[3..], " \t");
             if (content.len == 0) continue;
         }
@@ -79,7 +78,7 @@ pub fn scan(self: *Scanner) !ScannedDocument {
             const sequence_value = if (content.len == 1)
                 ""
             else
-                stripInlineComment(std.mem.trimLeft(u8, content[2..], " "));
+                stripInlineComment(std.mem.trimLeft(u8, content[2..], " \t"));
             try self.lines.append(self.allocator, .{
                 .line_no = line_no,
                 .indent = indent,
@@ -91,10 +90,30 @@ pub fn scan(self: *Scanner) !ScannedDocument {
             continue;
         }
 
+        // Explicit mapping key: ? key
+        if (content[0] == '?' and (content.len == 1 or content[1] == ' ' or content[1] == '\t')) {
+            const key = if (content.len <= 1)
+                ""
+            else
+                std.mem.trim(u8, content[2..], " \t");
+            const real_key = if (key.len > 0) stripInlineComment(key) else key;
+            try self.lines.append(self.allocator, .{
+                .line_no = line_no,
+                .indent = indent,
+                .kind = .mapping_entry,
+                .key = if (real_key.len > 0) real_key else "~",
+                .key_style = if (real_key.len > 0) detectStyle(real_key) else .plain,
+                .value = "",
+                .style = .plain,
+                .span = makeSpan(line_no, indent, line.len),
+            });
+            continue;
+        }
+
         if (findMappingColon(content)) |idx| {
-            const key = std.mem.trimRight(u8, content[0..idx], " ");
+            const key = std.mem.trimRight(u8, content[0..idx], " \t");
             if (key.len == 0) return Error.Parse.InvalidMappingKey;
-            const value = stripInlineComment(std.mem.trimLeft(u8, content[idx + 1 ..], " "));
+            const value = stripInlineComment(std.mem.trimLeft(u8, content[idx + 1 ..], " \t"));
             try self.lines.append(self.allocator, .{
                 .line_no = line_no,
                 .indent = indent,
@@ -126,7 +145,6 @@ pub fn scan(self: *Scanner) !ScannedDocument {
     };
 }
 
-/// Tokenize an inline flow collection (`[]` / `{}`) expression.
 pub fn tokenizeFlow(
     allocator: std.mem.Allocator,
     text: []const u8,
@@ -139,7 +157,7 @@ pub fn tokenizeFlow(
     var i: usize = 0;
     while (i < text.len) {
         const c = text[i];
-        if (c == ' ' or c == '\t') {
+        if (c == ' ' or c == '\t' or c == '\n' or c == '\r') {
             i += 1;
             continue;
         }
@@ -156,7 +174,7 @@ pub fn tokenizeFlow(
                 const marker = c;
                 i += 1;
                 const name_start = i;
-                while (i < text.len and isNameChar(text[i])) : (i += 1) {}
+                while (i < text.len and isFlowNameChar(text[i])) : (i += 1) {}
                 const lexeme = text[name_start..i];
                 try out.append(allocator, .{
                     .kind = if (marker == '*') .alias else .scalar,
@@ -164,6 +182,16 @@ pub fn tokenizeFlow(
                     .span = makeSpan(line_no, start_col, column_base + i),
                     .scalar_style = .plain,
                 });
+                continue;
+            },
+            '#' => {
+                // Comment: skip until end of line or end of text
+                while (i < text.len and text[i] != '\n') : (i += 1) {}
+                continue;
+            },
+            '!' => {
+                i += 1;
+                while (i < text.len and text[i] != ' ' and text[i] != '\t' and text[i] != '\n' and !isFlowDelimiter(text[i])) : (i += 1) {}
                 continue;
             },
             '\'', '"' => {
@@ -195,8 +223,8 @@ pub fn tokenizeFlow(
             },
             else => {
                 const start = i;
-                while (i < text.len and !isFlowDelimiter(text[i])) : (i += 1) {}
-                const lexeme = std.mem.trim(u8, text[start..i], " ");
+                while (i < text.len and !isFlowDelimiter(text[i]) and text[i] != '\n' and text[i] != '\r') : (i += 1) {}
+                const lexeme = std.mem.trim(u8, text[start..i], " \t");
                 if (lexeme.len == 0) continue;
                 try out.append(allocator, .{
                     .kind = .scalar,
@@ -214,7 +242,6 @@ pub fn tokenizeFlow(
     return out.toOwnedSlice(allocator);
 }
 
-/// Find a mapping colon not nested in quotes/flow collections.
 pub fn findInlineMappingColon(text: []const u8) ?usize {
     return findMappingColon(text);
 }
@@ -255,14 +282,26 @@ fn findMappingColon(text: []const u8) ?usize {
     var in_double = false;
     var depth_square: usize = 0;
     var depth_curly: usize = 0;
+    var skip_next = false;
 
     for (text, 0..) |c, idx| {
+        if (skip_next) {
+            skip_next = false;
+            continue;
+        }
         switch (c) {
+            '\\' => {
+                if (in_double) skip_next = true;
+            },
             '\'' => {
-                if (!in_double) in_single = !in_single;
+                if (idx == 0 or in_single) {
+                    if (!in_double) in_single = !in_single;
+                }
             },
             '"' => {
-                if (!in_single) in_double = !in_double;
+                if (idx == 0 or in_double) {
+                    if (!in_single) in_double = !in_double;
+                }
             },
             '[' => {
                 if (!in_single and !in_double) depth_square += 1;
@@ -277,7 +316,11 @@ fn findMappingColon(text: []const u8) ?usize {
                 if (!in_single and !in_double and depth_curly > 0) depth_curly -= 1;
             },
             ':' => {
-                if (!in_single and !in_double and depth_square == 0 and depth_curly == 0) return idx;
+                if (!in_single and !in_double and depth_square == 0 and depth_curly == 0) {
+                    if (idx + 1 >= text.len or text[idx + 1] == ' ' or text[idx + 1] == '\t') {
+                        return idx;
+                    }
+                }
             },
             else => {},
         }
@@ -290,9 +333,17 @@ fn stripInlineComment(text: []const u8) []const u8 {
     var in_double = false;
     var depth_square: usize = 0;
     var depth_curly: usize = 0;
+    var skip_next = false;
 
     for (text, 0..) |c, idx| {
+        if (skip_next) {
+            skip_next = false;
+            continue;
+        }
         switch (c) {
+            '\\' => {
+                if (in_double) skip_next = true;
+            },
             '\'' => {
                 if (!in_double) in_single = !in_single;
             },
@@ -328,9 +379,18 @@ fn isFlowDelimiter(c: u8) bool {
     return c == '[' or c == ']' or c == '{' or c == '}' or c == ',' or c == ':';
 }
 
-fn isNameChar(c: u8) bool {
+fn isFlowNameChar(c: u8) bool {
     return (c >= 'a' and c <= 'z') or
         (c >= 'A' and c <= 'Z') or
         (c >= '0' and c <= '9') or
-        c == '_' or c == '-';
+        c == '_' or c == '-' or c == '.';
+}
+
+/// Anchor/alias names in block context: any non-whitespace, non-flow-indicator char.
+pub fn isBlockAnchorChar(c: u8) bool {
+    return switch (c) {
+        ' ', '\t', '\n', '\r', '[', ']', '{', '}', ',' => false,
+        0 => false,
+        else => true,
+    };
 }

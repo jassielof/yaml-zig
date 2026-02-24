@@ -19,11 +19,13 @@ pub const Kind = enum {
 
 pub const SequenceStart = struct {
     style: Token.CollectionStyle = .block,
+    anchor: ?[]const u8 = null,
     span: Span = .{},
 };
 
 pub const MappingStart = struct {
     style: Token.CollectionStyle = .block,
+    anchor: ?[]const u8 = null,
     span: Span = .{},
 };
 
