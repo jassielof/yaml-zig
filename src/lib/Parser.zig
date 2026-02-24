@@ -73,7 +73,7 @@ fn parseBlockValue(self: *Parser, indent: usize) anyerror!void {
     }
 
     if (line.kind == .scalar and (line.style == .literal or line.style == .folded)) {
-        const block = try self.collectBlockScalar(line.indent, line.style);
+        const block = try self.collectBlockScalar(line.indent, line.style, line.value, line.line_no);
         defer self.allocator.free(block);
         try self.pushScalar(block, line.style, null, line.span);
         return;
@@ -154,7 +154,7 @@ fn parseBlockSequence(self: *Parser, indent: usize) anyerror!void {
         }
 
         if (line.style == .literal or line.style == .folded) {
-            const block = try self.collectBlockScalar(line.indent, line.style);
+            const block = try self.collectBlockScalar(line.indent, line.style, line.value, line.line_no);
             defer self.allocator.free(block);
             try self.pushScalar(block, line.style, null, line.span);
             continue;
@@ -214,7 +214,7 @@ fn parseBlockMapping(self: *Parser, indent: usize) anyerror!void {
         }
 
         if (line.style == .literal or line.style == .folded) {
-            const block = try self.collectBlockScalar(line.indent, line.style);
+            const block = try self.collectBlockScalar(line.indent, line.style, line.value, line.line_no);
             defer self.allocator.free(block);
             try self.pushScalar(block, line.style, null, line.span);
             continue;
@@ -234,7 +234,13 @@ fn parseBlockMapping(self: *Parser, indent: usize) anyerror!void {
     try self.pushSimple(.mapping_end, .{});
 }
 
-fn collectBlockScalar(self: *Parser, parent_indent: usize, style: Token.ScalarStyle) anyerror![]u8 {
+fn collectBlockScalar(
+    self: *Parser,
+    parent_indent: usize,
+    style: Token.ScalarStyle,
+    header_value: []const u8,
+    header_line_no: usize,
+) anyerror![]u8 {
     self.index += 1;
     var out: std.ArrayListUnmanaged(u8) = .{};
     defer out.deinit(self.allocator);
@@ -269,6 +275,36 @@ fn collectBlockScalar(self: *Parser, parent_indent: usize, style: Token.ScalarSt
         prev_line_no = line.line_no;
         self.index += 1;
     }
+
+    if (out.items.len == 0) {
+        const boundary_line_no = if (self.index < self.scanned.lines.items.len)
+            self.scanned.lines.items[self.index].line_no
+        else
+            countSourceLines(self.scanned.source);
+        const blank_count = if (boundary_line_no > header_line_no) boundary_line_no - header_line_no - 1 else 0;
+        var i: usize = 0;
+        while (i < blank_count) : (i += 1) try out.append(self.allocator, '\n');
+    }
+
+    const chomp = detectChompMode(header_value);
+    switch (chomp) {
+        .strip => {
+            while (out.items.len > 0 and out.items[out.items.len - 1] == '\n') {
+                _ = out.pop();
+            }
+        },
+        .clip => {
+            var trailing: usize = 0;
+            while (trailing < out.items.len and out.items[out.items.len - 1 - trailing] == '\n') : (trailing += 1) {}
+            if (trailing == 0 and out.items.len > 0 and style == .literal) {
+                try out.append(self.allocator, '\n');
+            } else if (trailing > 1) {
+                out.items.len -= (trailing - 1);
+            }
+        },
+        .keep => {},
+    }
+
     return out.toOwnedSlice(self.allocator);
 }
 
@@ -550,7 +586,13 @@ fn collectMultilineQuotedScalar(self: *Parser, base_indent: usize, style: Token.
         const line = self.scanned.lines.items[self.index];
         if (line.indent < base_indent) break;
         try out.append(self.allocator, ' ');
-        try out.appendSlice(self.allocator, std.mem.trim(u8, line.value, " \t"));
+        const trimmed = std.mem.trim(u8, line.value, " \t");
+        if (std.mem.startsWith(u8, trimmed, "... ")) {
+            try out.appendSlice(self.allocator, "...");
+            try out.appendSlice(self.allocator, std.mem.trimLeft(u8, trimmed[4..], " "));
+        } else {
+            try out.appendSlice(self.allocator, trimmed);
+        }
         self.index += 1;
     }
 
@@ -574,6 +616,31 @@ fn hasClosingQuote(text: []const u8, quote: u8) bool {
         if ((slash_count % 2) != 0) return false;
     }
     return true;
+}
+
+const ChompMode = enum {
+    clip,
+    strip,
+    keep,
+};
+
+fn detectChompMode(header_value: []const u8) ChompMode {
+    const trimmed = std.mem.trim(u8, header_value, " ");
+    if (trimmed.len == 0) return .clip;
+    for (trimmed) |ch| {
+        if (ch == '+') return .keep;
+        if (ch == '-') return .strip;
+    }
+    return .clip;
+}
+
+fn countSourceLines(source: []const u8) usize {
+    if (source.len == 0) return 0;
+    var lines: usize = 1;
+    for (source) |ch| {
+        if (ch == '\n') lines += 1;
+    }
+    return lines;
 }
 
 fn isAliasToken(raw: []const u8) ?[]const u8 {
