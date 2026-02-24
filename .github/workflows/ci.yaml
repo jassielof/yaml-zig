@@ -55,7 +55,7 @@ jobs:
         uses: mlugg/setup-zig@v2
 
       - name: Tests
-        run: zig build --summary all tests -Doptimize=ReleaseSafe
+        run: zig build --summary all tests -Doptimize=ReleaseSafe -Dsummary=true
 
       - name: Setup Python
         if: always()
