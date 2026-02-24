@@ -271,9 +271,25 @@ fn parseBlockSequence(self: *Parser, indent: usize) anyerror!void {
 
         // For plain scalars, collect multiline continuation
         if (line.style == .plain) {
-            const joined = try self.collectPlainContinuation(indent + 1, line.value);
-            defer self.allocator.free(joined);
-            try self.parseScalarLikeValue(joined, .plain, line.line_no, line.indent + 2);
+            var final_text = try self.collectPlainContinuation(indent + 1, line.value);
+            defer self.allocator.free(final_text);
+
+            // Absorb sequence_item lines at indent > seq_indent as plain text (AB8U)
+            while (self.index < self.scanned.lines.items.len) {
+                const nl = self.scanned.lines.items[self.index];
+                if (nl.kind != .sequence_item or nl.indent <= indent) break;
+                const trimmed = std.mem.trim(u8, nl.value, " ");
+                const new_buf = try self.allocator.alloc(u8, final_text.len + 3 + trimmed.len);
+                @memcpy(new_buf[0..final_text.len], final_text);
+                new_buf[final_text.len] = ' ';
+                new_buf[final_text.len + 1] = '-';
+                new_buf[final_text.len + 2] = ' ';
+                @memcpy(new_buf[final_text.len + 3 ..][0..trimmed.len], trimmed);
+                self.allocator.free(final_text);
+                final_text = new_buf[0 .. final_text.len + 3 + trimmed.len];
+                self.index += 1;
+            }
+            try self.parseScalarLikeValue(final_text, .plain, line.line_no, line.indent + 2);
         } else {
             try self.parseScalarLikeValue(line.value, line.style, line.line_no, line.indent + 2);
             self.index += 1;
@@ -498,7 +514,6 @@ fn emitSingleMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_inden
                                 }
                             } else {
                                 try self.parseScalarLikeValue(sl.value, sl.style, sl.line_no, sl.indent + 2);
-                                self.index += 1;
                             }
                         }
                         try self.pushSimple(.sequence_end, .{});
@@ -522,6 +537,69 @@ fn emitSingleMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_inden
                         try self.parseBlockValue(next.indent, false);
                     }
                 } else {
+                    // Check if next is tag/anchor-only scalar followed by a structure or block scalar
+                    if (next.kind == .scalar and next.style == .plain) {
+                        const nv = stripTagPrefix(std.mem.trim(u8, next.value, " "));
+                        const nv_anc = extractLeadingAnchor(nv);
+                        const nv_rest = std.mem.trim(u8, stripAnchorPrefix(nv), " ");
+                        const nv_anchor: ?[]const u8 = if (nv_anc.name.len > 0) nv_anc.name else null;
+                        if (nv_rest.len == 0 and (nv_anchor != null or !std.mem.eql(u8, std.mem.trim(u8, next.value, " "), nv))) {
+                            const saved_idx = self.index;
+                            self.index += 1;
+                            if (self.index < self.scanned.lines.items.len) {
+                                const nn = self.scanned.lines.items[self.index];
+                                if (nn.kind == .scalar and (nn.style == .literal or nn.style == .folded)) {
+                                    const block = try self.collectBlockScalar(parent_indent, nn.style, nn.value, nn.line_no);
+                                    defer self.allocator.free(block);
+                                    try self.pushScalar(block, nn.style, nv_anchor, line.span);
+                                    return;
+                                }
+                                if (nv_anchor) |anch| {
+                                    if (nn.kind == .sequence_item and nn.indent >= parent_indent) {
+                                        try self.events.append(self.allocator, .{
+                                            .kind = .sequence_start,
+                                            .data = .{ .sequence_start = .{
+                                                .style = .block,
+                                                .anchor = try self.allocator.dupe(u8, anch),
+                                            } },
+                                        });
+                                        while (self.index < self.scanned.lines.items.len) {
+                                            const sl = self.scanned.lines.items[self.index];
+                                            if (sl.indent != nn.indent or sl.kind != .sequence_item) break;
+                                            self.index += 1;
+                                            if (sl.value.len == 0) {
+                                                if (self.index < self.scanned.lines.items.len and self.scanned.lines.items[self.index].indent > nn.indent) {
+                                                    try self.parseBlockValue(self.scanned.lines.items[self.index].indent, false);
+                                                } else {
+                                                    try self.pushScalar("null", .plain, null, sl.span);
+                                                }
+                                            } else {
+                                                try self.parseScalarLikeValue(sl.value, sl.style, sl.line_no, sl.indent + 2);
+                                            }
+                                        }
+                                        try self.pushSimple(.sequence_end, .{});
+                                        return;
+                                    } else if (nn.kind == .mapping_entry and nn.indent >= parent_indent) {
+                                        try self.events.append(self.allocator, .{
+                                            .kind = .mapping_start,
+                                            .data = .{ .mapping_start = .{
+                                                .style = .block,
+                                                .anchor = try self.allocator.dupe(u8, anch),
+                                            } },
+                                        });
+                                        while (self.index < self.scanned.lines.items.len) {
+                                            const ml = self.scanned.lines.items[self.index];
+                                            if (ml.indent != nn.indent or ml.kind != .mapping_entry) break;
+                                            try self.emitSingleMappingEntry(ml, nn.indent);
+                                        }
+                                        try self.pushSimple(.mapping_end, .{});
+                                        return;
+                                    }
+                                }
+                            }
+                            self.index = saved_idx;
+                        }
+                    }
                     try self.parseBlockValue(next.indent, false);
                 }
             } else if (next.indent == parent_indent and next.kind == .sequence_item) {
@@ -545,7 +623,6 @@ fn emitSingleMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_inden
                             }
                         } else {
                             try self.parseScalarLikeValue(sl.value, sl.style, sl.line_no, sl.indent + 2);
-                            self.index += 1;
                         }
                     }
                     try self.pushSimple(.sequence_end, .{});
@@ -579,6 +656,23 @@ fn emitSingleMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_inden
             defer self.allocator.free(block);
             try self.pushScalar(block, bs_style, null, line.span);
             return;
+        }
+    }
+
+    // Check for tag prefix + unclosed quoted scalar (e.g., !!binary "\...)
+    if (line.style == .plain and line.value.len > 0) {
+        const after_tag2 = stripTagPrefix(std.mem.trim(u8, line.value, " "));
+        const after_anchor2 = stripAnchorPrefix(after_tag2);
+        const trimmed_after2 = std.mem.trimLeft(u8, after_anchor2, " ");
+        if (trimmed_after2.len > 0 and (trimmed_after2[0] == '"' or trimmed_after2[0] == '\'')) {
+            const qs: Token.ScalarStyle = if (trimmed_after2[0] == '"') .double_quoted else .single_quoted;
+            const quote2: u8 = trimmed_after2[0];
+            if (!hasClosingQuote(trimmed_after2, quote2)) {
+                const multiline = try self.collectMultilineQuotedValue(line.indent, trimmed_after2, qs);
+                defer self.allocator.free(multiline);
+                try self.parseScalarLikeValue(multiline, qs, line.line_no, line.indent);
+                return;
+            }
         }
     }
 
@@ -682,7 +776,7 @@ fn collectBlockScalar(
             const li = countSpaces(rline);
 
             if (li >= rline.len) {
-                if (li > bi) {
+                if (has_content and li > bi) {
                     try out.appendSlice(self.allocator, rline[bi..]);
                     try out.append(self.allocator, '\n');
                 } else {
@@ -820,7 +914,12 @@ fn parseScalarLikeValue(
 
     if (working_style == .plain and working[0] == '*') {
         var end: usize = 1;
-        while (end < working.len and Scanner.isBlockAnchorChar(working[end])) : (end += 1) {}
+        while (end < working.len) : (end += 1) {
+            const c = working[end];
+            // Stop at ":" when it's the key-value separator (followed by space or end)
+            if (c == ':' and (end + 1 >= working.len or working[end + 1] == ' ' or working[end + 1] == '\t')) break;
+            if (!Scanner.isBlockAnchorChar(c)) break;
+        }
         const alias_name = working[1..end];
         if (alias_name.len == 0) return Error.Parse.InvalidAlias;
         try self.events.append(self.allocator, .{
@@ -831,7 +930,18 @@ fn parseScalarLikeValue(
     }
 
     if (working[0] == '[' or working[0] == '{') {
+        const pre_flow_count = self.events.items.len;
         try self.parseFlow(working, line_no, col);
+        if (anchor_name) |aname| {
+            if (self.events.items.len > pre_flow_count) {
+                const first = &self.events.items[pre_flow_count];
+                switch (first.kind) {
+                    .sequence_start => first.data.sequence_start.anchor = try self.allocator.dupe(u8, aname),
+                    .mapping_start => first.data.mapping_start.anchor = try self.allocator.dupe(u8, aname),
+                    else => {},
+                }
+            }
+        }
         return;
     }
 
@@ -1053,9 +1163,13 @@ fn stripAnchorPrefix(raw: []const u8) []const u8 {
     var value = std.mem.trimLeft(u8, raw, " ");
     while (value.len > 1 and value[0] == '&') {
         var i: usize = 1;
-        while (i < value.len and Scanner.isBlockAnchorChar(value[i])) : (i += 1) {}
+        while (i < value.len) : (i += 1) {
+            const c = value[i];
+            if (c == ':' and (i + 1 >= value.len or value[i + 1] == ' ' or value[i + 1] == '\t')) break;
+            if (!Scanner.isBlockAnchorChar(c)) break;
+        }
         if (i <= 1) break;
-        value = std.mem.trimLeft(u8, value[i..], " ");
+        value = std.mem.trimLeft(u8, value[i..], " :\t");
     }
     return value;
 }
@@ -1065,11 +1179,17 @@ fn extractLeadingAnchor(raw: []const u8) struct { name: []const u8, rest: []cons
     if (value.len <= 1 or value[0] != '&') return .{ .name = "", .rest = raw };
 
     var i: usize = 1;
-    while (i < value.len and Scanner.isBlockAnchorChar(value[i])) : (i += 1) {}
+    while (i < value.len) : (i += 1) {
+        const c = value[i];
+        // Stop before ":" when it's the key-value separator (e.g. "&x: value" -> name "x")
+        if (c == ':' and (i + 1 >= value.len or value[i + 1] == ' ' or value[i + 1] == '\t')) break;
+        if (!Scanner.isBlockAnchorChar(c)) break;
+    }
     if (i <= 1) return .{ .name = "", .rest = raw };
 
     const name = value[1..i];
-    value = std.mem.trimLeft(u8, value[i..], " ");
+    // Strip optional ": " after anchor (e.g. "&a: key" -> key)
+    value = std.mem.trimLeft(u8, value[i..], " :\t");
     return .{ .name = name, .rest = value };
 }
 

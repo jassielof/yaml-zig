@@ -64,10 +64,13 @@ pub fn scan(self: *Scanner) !ScannedDocument {
         var content = stripInlineComment(std.mem.trimLeft(u8, line[indent..], " "));
         if (content.len == 0 or std.mem.startsWith(u8, content, "#")) continue;
         if (!past_doc_start and content[0] == '%') continue;
-        if (std.mem.startsWith(u8, content, "---") and (content.len == 3 or content[3] == ' ' or content[3] == '\t')) {
-            past_doc_start = true;
-            content = std.mem.trimLeft(u8, content[3..], " \t");
-            if (content.len == 0) continue;
+        // Document start "---" only when followed by space, tab, or end (not plain scalar like "---word1")
+        if (content.len >= 3 and std.mem.eql(u8, content[0..3], "---")) {
+            if (content.len == 3 or content[3] == ' ' or content[3] == '\t') {
+                past_doc_start = true;
+                content = std.mem.trimLeft(u8, content[3..], " \t");
+                if (content.len == 0) continue;
+            }
         }
         if (std.mem.startsWith(u8, content, "...")) {
             const after = std.mem.trim(u8, content[3..], " \t");
@@ -284,6 +287,10 @@ fn findMappingColon(text: []const u8) ?usize {
     var depth_curly: usize = 0;
     var skip_next = false;
 
+    // Find colon that separates key from value.
+    // Use first colon when value starts with "&" or "*" (e.g. "a: &x: foo" -> key "a").
+    // Otherwise use rightmost (e.g. "key ends with two colons::: value" -> key "key ends with two colons::").
+    var last_valid: ?usize = null;
     for (text, 0..) |c, idx| {
         if (skip_next) {
             skip_next = false;
@@ -318,14 +325,18 @@ fn findMappingColon(text: []const u8) ?usize {
             ':' => {
                 if (!in_single and !in_double and depth_square == 0 and depth_curly == 0) {
                     if (idx + 1 >= text.len or text[idx + 1] == ' ' or text[idx + 1] == '\t') {
-                        return idx;
+                        const after = std.mem.trimLeft(u8, text[idx + 1 ..], " \t");
+                        if (after.len > 0 and (after[0] == '&' or after[0] == '*')) {
+                            return idx;
+                        }
+                        last_valid = idx;
                     }
                 }
             },
             else => {},
         }
     }
-    return null;
+    return last_valid;
 }
 
 fn stripInlineComment(text: []const u8) []const u8 {
@@ -372,6 +383,7 @@ fn stripInlineComment(text: []const u8) []const u8 {
             else => {},
         }
     }
+    if (in_single or in_double) return text;
     return std.mem.trimRight(u8, text, " \t");
 }
 

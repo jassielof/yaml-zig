@@ -36,7 +36,7 @@ pub fn compose(
     }
 
     var index: usize = 2;
-    const root = try composeNode(allocator, events, &index, options, &anchors);
+    const root = try composeNode(allocator, events, &index, options, &anchors, null);
 
     if (index >= events.len or events[index].kind != .document_end) {
         var owned_root = root;
@@ -59,6 +59,7 @@ fn composeNode(
     index: *usize,
     options: Options.Parse,
     anchors: *std.StringHashMapUnmanaged(Node),
+    skip_anchor: ?[]const u8,
 ) !Node {
     if (index.* >= events.len) return Error.Parse.UnexpectedToken;
     const ev = events[index.*];
@@ -73,7 +74,9 @@ fn composeNode(
             );
 
             if (ev.data.scalar.anchor) |anchor_name| {
-                try putAnchor(allocator, anchors, anchor_name, resolved);
+                if (skip_anchor == null or !std.mem.eql(u8, anchor_name, skip_anchor.?)) {
+                    try putAnchor(allocator, anchors, anchor_name, resolved);
+                }
             }
 
             return resolved;
@@ -88,7 +91,7 @@ fn composeNode(
             }
 
             while (index.* < events.len and events[index.*].kind != .sequence_end) {
-                try seq.append(allocator, try composeNode(allocator, events, index, options, anchors));
+                try seq.append(allocator, try composeNode(allocator, events, index, options, anchors, null));
             }
             if (index.* >= events.len or events[index.*].kind != .sequence_end) return Error.Parse.UnexpectedToken;
             index.* += 1;
@@ -111,8 +114,21 @@ fn composeNode(
             }
 
             while (index.* < events.len and events[index.*].kind != .mapping_end) {
-                const key = switch (events[index.*].kind) {
-                    .scalar => try allocator.dupe(u8, events[index.*].data.scalar.value),
+                const key_ev = events[index.*];
+                const key = switch (key_ev.kind) {
+                    .scalar => blk: {
+                        var resolved_key = try Schema.resolveScalar(
+                            allocator,
+                            key_ev.data.scalar.value,
+                            key_ev.data.scalar.style,
+                            options.resolve_core_schema,
+                        );
+                        defer resolved_key.deinit(allocator);
+                        if (key_ev.data.scalar.anchor) |anchor_name| {
+                            try putAnchor(allocator, anchors, anchor_name, resolved_key);
+                        }
+                        break :blk try nodeToKeyString(allocator, resolved_key);
+                    },
                     .alias => blk: {
                         const alias_name = events[index.*].data.alias.name;
                         const aliased = anchors.get(alias_name) orelse return Error.Parse.InvalidAlias;
@@ -122,7 +138,8 @@ fn composeNode(
                 };
                 errdefer allocator.free(key);
                 index.* += 1;
-                var value = try composeNode(allocator, events, index, options, anchors);
+                const key_anchor = if (key_ev.kind == .scalar) key_ev.data.scalar.anchor else null;
+                var value = try composeNode(allocator, events, index, options, anchors, key_anchor);
                 errdefer value.deinit(allocator);
 
                 if (findMapKey(map.items, key)) |existing_idx| {
