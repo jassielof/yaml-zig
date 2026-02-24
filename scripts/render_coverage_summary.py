@@ -11,14 +11,10 @@ def append_summary(lines: list[str]) -> None:
         summary_file.write("\n".join(lines) + "\n")
 
 
-def format_id_list(ids: list[str], limit: int = 120) -> list[str]:
+def bullet_list(ids: list[str]) -> str:
     if not ids:
-        return ["_none_"]
-    items = [f"`{fid}`" for fid in ids[:limit]]
-    result = [", ".join(items)]
-    if len(ids) > limit:
-        result.append(f"… and {len(ids) - limit} more")
-    return result
+        return "_none_"
+    return " ".join(f"`{fid}`" for fid in ids)
 
 
 def main() -> int:
@@ -38,6 +34,7 @@ def main() -> int:
     total = report.get("total", 0)
     unsupported = report.get("unsupported", 0)
     failed = report.get("failed", 0)
+    passed_ids = report.get("passed_ids", [])
     failed_ids = report.get("failed_ids", [])
     unsupported_ids = report.get("unsupported_ids", [])
 
@@ -47,20 +44,10 @@ def main() -> int:
             "",
             "| Passed | Failed | Unsupported |",
             "|-------:|-------:|------------:|",
-            f"| {passed}/{total} ({coverage:.2f}%) | {failed} | {unsupported} |",
-            "",
+            f"| {passed} | {failed} | {unsupported} |",
+            f"| {bullet_list(passed_ids)} | {bullet_list(failed_ids)} | {bullet_list(unsupported_ids)} |",
         ]
     )
-
-    lines.append("<details><summary>Failed fixture IDs</summary>")
-    lines.append("")
-    lines.extend(format_id_list(failed_ids))
-    lines.extend(["", "</details>", ""])
-
-    lines.append("<details><summary>Unsupported fixture IDs</summary>")
-    lines.append("")
-    lines.extend(format_id_list(unsupported_ids))
-    lines.extend(["", "</details>"])
 
     append_summary(lines)
     return 0
