@@ -600,6 +600,26 @@ fn emitSingleMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_inden
                             self.index = saved_idx;
                         }
                     }
+                    // 2SXE: "foo:\n  *a:" - single mapping entry with alias key and empty value
+                    // is the alias as value, not a nested mapping
+                    if (next.kind == .mapping_entry and next.indent > parent_indent) {
+                        if (isAliasToken(next.key)) |alias_name| {
+                            if (isVirtualEmptyValue(next.value, next.style)) {
+                            const following = self.index + 1;
+                            const sole_entry = following >= self.scanned.lines.items.len or
+                                self.scanned.lines.items[following].indent != next.indent or
+                                self.scanned.lines.items[following].kind != .mapping_entry;
+                            if (sole_entry) {
+                                self.index += 1;
+                                try self.events.append(self.allocator, .{
+                                    .kind = .alias,
+                                    .data = .{ .alias = .{ .name = try self.allocator.dupe(u8, alias_name), .span = next.span } },
+                                });
+                                return;
+                            }
+                            }
+                        }
+                    }
                     try self.parseBlockValue(next.indent, false);
                 }
             } else if (next.indent == parent_indent and next.kind == .sequence_item) {
@@ -1254,15 +1274,20 @@ fn collectMultilineQuotedScalar(self: *Parser, base_indent: usize, style: Token.
             const trimmed = std.mem.trimLeft(u8, line.value, " \t");
             try out.appendSlice(self.allocator, trimmed);
         } else {
+            const trimmed = std.mem.trimLeft(u8, std.mem.trim(u8, line.value, " \t"), " \t");
+            const doc_end = trimDocEndLine(trimmed, style);
             if (gap > 0) {
                 var g: usize = 0;
                 while (g < gap) : (g += 1) try out.append(self.allocator, '\n');
             } else {
                 try out.append(self.allocator, ' ');
             }
-
-            const trimmed = std.mem.trimLeft(u8, std.mem.trim(u8, line.value, " \t"), " \t");
-            try out.appendSlice(self.allocator, trimmed);
+            if (doc_end.prefix.len > 0) {
+                try out.appendSlice(self.allocator, doc_end.prefix);
+                try out.appendSlice(self.allocator, doc_end.rest);
+            } else {
+                try out.appendSlice(self.allocator, doc_end.rest);
+            }
         }
         prev_line_no = line.line_no;
         self.index += 1;
@@ -1293,21 +1318,35 @@ fn collectMultilineQuotedValue(self: *Parser, base_indent: usize, initial: []con
             const trimmed = std.mem.trimLeft(u8, line.value, " \t");
             try out.appendSlice(self.allocator, trimmed);
         } else {
+            const trimmed = std.mem.trimLeft(u8, std.mem.trim(u8, line.value, " \t"), " \t");
+            const doc_end = trimDocEndLine(trimmed, style);
             if (gap > 0) {
                 var g: usize = 0;
                 while (g < gap) : (g += 1) try out.append(self.allocator, '\n');
             } else {
                 try out.append(self.allocator, ' ');
             }
-
-            const trimmed = std.mem.trimLeft(u8, std.mem.trim(u8, line.value, " \t"), " \t");
-            try out.appendSlice(self.allocator, trimmed);
+            if (doc_end.prefix.len > 0) {
+                try out.appendSlice(self.allocator, doc_end.prefix);
+                try out.appendSlice(self.allocator, doc_end.rest);
+            } else {
+                try out.appendSlice(self.allocator, doc_end.rest);
+            }
         }
         prev_line_no = line.line_no;
         self.index += 1;
     }
 
     return out.toOwnedSlice(self.allocator);
+}
+
+/// 9MQT/01: In double-quoted, "... x" -> "...x" (strip space after "..." at line start)
+fn trimDocEndLine(content: []const u8, style: Token.ScalarStyle) struct { prefix: []const u8, rest: []const u8 } {
+    if (style != .double_quoted or content.len <= 3) return .{ .prefix = "", .rest = content };
+    if (!std.mem.eql(u8, content[0..3], "...")) return .{ .prefix = "", .rest = content };
+    if (content.len == 3) return .{ .prefix = "", .rest = content };
+    if (content[3] != ' ') return .{ .prefix = "", .rest = content };
+    return .{ .prefix = "...", .rest = std.mem.trimLeft(u8, content[3..], " ") };
 }
 
 fn stripTrailingQuoteWs(out: *std.ArrayListUnmanaged(u8), style: Token.ScalarStyle) void {
