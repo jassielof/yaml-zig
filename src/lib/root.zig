@@ -40,6 +40,14 @@ pub fn parseDocument(
     return Composer.compose(allocator, events, options);
 }
 
+test parseDocument {
+    const allocator = std.testing.allocator;
+    var doc = try parseDocument(allocator, "name: Alice\nage: 30", .{});
+    defer doc.deinit();
+    // verify the root is a mapping
+    try std.testing.expect(doc.root.tag == .mapping);
+}
+
 /// Parse YAML text and return only the root node tree.
 pub fn parseNode(
     allocator: std.mem.Allocator,
@@ -62,6 +70,15 @@ pub fn stringifyDocument(
     return Serializer.stringifyDocument(allocator, document, options);
 }
 
+test stringifyDocument {
+    const allocator = std.testing.allocator;
+    var doc = try parseDocument(allocator, "key: value", .{});
+    defer doc.deinit();
+
+    const out = try stringifyDocument(allocator, &doc, .{});
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("key: value\n", out);
+}
 /// Serialize a standalone node tree into UTF-8 YAML bytes.
 ///
 /// Returned bytes are allocated with `allocator`.

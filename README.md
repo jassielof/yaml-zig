@@ -4,7 +4,7 @@ This library provides de/serialization for YAML.
 
 ## Usage and examples
 
-For usage and examples, see the [basic tests](tests/basic.zig) for code examples, the API documentation is linked in the repository description, which is generated from the source code comments (the whole library is documented).
+For usage and examples, see the single [basic tests](tests/basic.zig) for code examples, or the library documentation is linked in the repository description, which is generated from the source code comments (the whole library is documented and with doc tests).
 
 ### As library
 
