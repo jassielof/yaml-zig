@@ -187,7 +187,10 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
                 .link_libc = true,
                 .imports = &.{
-                    .{ .name = fy_mod_name, .module = fy_mod },
+                    .{
+                        .name = fy_mod_name,
+                        .module = fy_mod,
+                    },
                 },
             },
         ),
