@@ -4,6 +4,11 @@
     .version = "0.1.0",
     .fingerprint = 0xea31a984633d8c3f,
     .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        .libfyaml = .{
+            .path = "modules/libfyaml",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",
