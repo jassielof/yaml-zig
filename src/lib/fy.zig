@@ -18,6 +18,7 @@ const fy_eventp = extern struct {
 
 extern fn fy_parse_private(fyp: *c.struct_fy_parser) ?*fy_eventp;
 extern fn fy_parse_eventp_recycle(fyp: *c.struct_fy_parser, fyep: *fy_eventp) void;
+extern fn fyz_create_silent_diag() ?*c.struct_fy_diag;
 
 pub const Error = error{
     ParseFailed,
@@ -55,6 +56,9 @@ pub const Document = struct {
 pub fn parseDocument(source: []const u8) Error!Document {
     var cfg = std.mem.zeroes(c.struct_fy_parse_cfg);
     cfg.flags = @as(@TypeOf(cfg.flags), c.FYPCF_QUIET | c.FYPCF_RESOLVE_DOCUMENT);
+    const diag = fyz_create_silent_diag();
+    defer if (diag) |resolved| c.fy_diag_destroy(resolved);
+    cfg.diag = diag;
 
     const raw = c.fy_document_build_from_string(&cfg, @ptrCast(source.ptr), source.len) orelse {
         return error.ParseFailed;
@@ -71,6 +75,9 @@ pub fn parseTestsuiteEventsAlloc(allocator: std.mem.Allocator, source: []const u
 pub fn parseTestsuiteEventsDetailedAlloc(allocator: std.mem.Allocator, source: []const u8) Error!TestsuiteParseResult {
     var cfg = std.mem.zeroes(c.struct_fy_parse_cfg);
     cfg.flags = @as(@TypeOf(cfg.flags), c.FYPCF_QUIET);
+    const diag = fyz_create_silent_diag();
+    defer if (diag) |resolved| c.fy_diag_destroy(resolved);
+    cfg.diag = diag;
 
     const parser = c.fy_parser_create(&cfg) orelse return error.ParseFailed;
     defer c.fy_parser_destroy(parser);

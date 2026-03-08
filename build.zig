@@ -73,6 +73,11 @@ pub fn build(b: *std.Build) void {
             .flags = &.{ "-std=c11", "-DWIN32_LEAN_AND_MEAN", "-D_CRT_SECURE_NO_WARNINGS" },
         });
         fy_c_lib.addCSourceFiles(.{
+            .root = b.path("."),
+            .files = &.{"src/lib/fy_diag_shim.c"},
+            .flags = &.{ "-std=c11", "-DWIN32_LEAN_AND_MEAN", "-D_CRT_SECURE_NO_WARNINGS" },
+        });
+        fy_c_lib.addCSourceFiles(.{
             .root = b.path("modules/libfyaml"),
             .files = &.{
                 "src/blake3/blake3_portable.c",
@@ -122,6 +127,11 @@ pub fn build(b: *std.Build) void {
                 "src/lib/fy-input-diag.c",
                 "src/lib/fy-parse-diag.c",
             },
+            .flags = &.{ "-std=c11", "-D_GNU_SOURCE" },
+        });
+        fy_c_lib.addCSourceFiles(.{
+            .root = b.path("."),
+            .files = &.{"src/lib/fy_diag_shim.c"},
             .flags = &.{ "-std=c11", "-D_GNU_SOURCE" },
         });
         fy_c_lib.addCSourceFiles(.{
