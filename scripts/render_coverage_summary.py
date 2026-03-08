@@ -17,16 +17,13 @@ def bullet_list(ids: list[str]) -> str:
     return " ".join(f"`{fid}`" for fid in ids)
 
 
-def main() -> int:
-    matrix_os = os.environ.get("MATRIX_OS", "unknown-os")
-    report_path = Path("zig-out/spec-coverage/coverage.json")
-
-    lines: list[str] = [f"### YAML Spec Coverage — `{matrix_os}`", ""]
+def append_report_section(lines: list[str], title: str, report_path: Path) -> None:
+    lines.extend([title, ""])
 
     if not report_path.exists():
         lines.append("Coverage report was not generated.")
-        append_summary(lines)
-        return 0
+        lines.append("")
+        return
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
     coverage = float(report.get("coverage_percent", 0.0))
@@ -46,8 +43,17 @@ def main() -> int:
             "|-------:|-------:|------------:|",
             f"| {passed} | {failed} | {unsupported} |",
             f"| {bullet_list(passed_ids)} | {bullet_list(failed_ids)} | {bullet_list(unsupported_ids)} |",
+            "",
         ]
     )
+
+
+def main() -> int:
+    matrix_os = os.environ.get("MATRIX_OS", "unknown-os")
+    lines: list[str] = [f"### YAML Spec Coverage — `{matrix_os}`", ""]
+
+    append_report_section(lines, "#### yaml", Path("zig-out/spec-coverage/coverage.json"))
+    append_report_section(lines, "#### fy", Path("zig-out/spec-coverage/coverage-fy.json"))
 
     append_summary(lines)
     return 0
