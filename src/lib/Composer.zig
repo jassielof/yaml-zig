@@ -20,7 +20,7 @@ pub fn compose(
 ) !Document {
     defer freeEvents(allocator, events);
 
-    var anchors: std.StringHashMapUnmanaged(Node) = .{};
+    var anchors: std.StringHashMapUnmanaged(Node) = .empty;
     defer {
         var it = anchors.iterator();
         while (it.next()) |entry| {
@@ -84,7 +84,7 @@ fn composeNode(
         .sequence_start => {
             const seq_anchor = ev.data.sequence_start.anchor;
             index.* += 1;
-            var seq: std.ArrayListUnmanaged(Node) = .{};
+            var seq: std.ArrayListUnmanaged(Node) = .empty;
             errdefer {
                 for (seq.items) |*item| item.deinit(allocator);
                 seq.deinit(allocator);
@@ -104,7 +104,7 @@ fn composeNode(
         .mapping_start => {
             const map_anchor = ev.data.mapping_start.anchor;
             index.* += 1;
-            var map: std.ArrayListUnmanaged(MapEntry) = .{};
+            var map: std.ArrayListUnmanaged(MapEntry) = .empty;
             errdefer {
                 for (map.items) |*entry| {
                     allocator.free(entry.key);

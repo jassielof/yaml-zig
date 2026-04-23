@@ -26,7 +26,7 @@ pub const Node = union(enum) {
             .float => |v| .{ .float = v },
             .string => |v| .{ .string = try allocator.dupe(u8, v) },
             .sequence => |seq| blk: {
-                var out: std.ArrayListUnmanaged(Node) = .{};
+                var out: std.ArrayListUnmanaged(Node) = .empty;
                 errdefer {
                     for (out.items) |*item| item.deinit(allocator);
                     out.deinit(allocator);
@@ -38,7 +38,7 @@ pub const Node = union(enum) {
                 break :blk .{ .sequence = out };
             },
             .mapping => |map| blk: {
-                var out: std.ArrayListUnmanaged(MapEntry) = .{};
+                var out: std.ArrayListUnmanaged(MapEntry) = .empty;
                 errdefer {
                     for (out.items) |*entry| {
                         allocator.free(entry.key);

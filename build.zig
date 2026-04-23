@@ -18,18 +18,18 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
-    fy_c_lib.linkLibC();
-    fy_c_lib.addIncludePath(b.path("modules/libfyaml/include"));
-    fy_c_lib.addIncludePath(b.path("modules/libfyaml/src/lib"));
-    fy_c_lib.addIncludePath(b.path("modules/libfyaml/src/util"));
-    fy_c_lib.addIncludePath(b.path("modules/libfyaml/src/xxhash"));
-    fy_c_lib.addIncludePath(b.path("modules/libfyaml/src/thread"));
-    fy_c_lib.addIncludePath(b.path("modules/libfyaml/src/allocator"));
-    fy_c_lib.addIncludePath(b.path("modules/libfyaml/src/blake3"));
-    fy_c_lib.addIncludePath(b.path("src/lib/fy_config"));
+    fy_c_lib.root_module.link_libc = true;
+    fy_c_lib.root_module.addIncludePath(b.path("modules/libfyaml/include"));
+    fy_c_lib.root_module.addIncludePath(b.path("modules/libfyaml/src/lib"));
+    fy_c_lib.root_module.addIncludePath(b.path("modules/libfyaml/src/util"));
+    fy_c_lib.root_module.addIncludePath(b.path("modules/libfyaml/src/xxhash"));
+    fy_c_lib.root_module.addIncludePath(b.path("modules/libfyaml/src/thread"));
+    fy_c_lib.root_module.addIncludePath(b.path("modules/libfyaml/src/allocator"));
+    fy_c_lib.root_module.addIncludePath(b.path("modules/libfyaml/src/blake3"));
+    fy_c_lib.root_module.addIncludePath(b.path("src/lib/fy_config"));
 
     if (target.result.os.tag == .windows) {
-        fy_c_lib.addCSourceFiles(.{
+        fy_c_lib.root_module.addCSourceFiles(.{
             .root = b.path("modules/libfyaml"),
             .files = &.{
                 "src/lib/fy-accel.c",
@@ -72,12 +72,12 @@ pub fn build(b: *std.Build) void {
             },
             .flags = &.{ "-std=c11", "-DWIN32_LEAN_AND_MEAN", "-D_CRT_SECURE_NO_WARNINGS" },
         });
-        fy_c_lib.addCSourceFiles(.{
+        fy_c_lib.root_module.addCSourceFiles(.{
             .root = b.path("."),
             .files = &.{"src/lib/fy_diag_shim.c"},
             .flags = &.{ "-std=c11", "-DWIN32_LEAN_AND_MEAN", "-D_CRT_SECURE_NO_WARNINGS" },
         });
-        fy_c_lib.addCSourceFiles(.{
+        fy_c_lib.root_module.addCSourceFiles(.{
             .root = b.path("modules/libfyaml"),
             .files = &.{
                 "src/blake3/blake3_portable.c",
@@ -86,7 +86,7 @@ pub fn build(b: *std.Build) void {
             .flags = &.{ "-std=c11", "-DWIN32_LEAN_AND_MEAN", "-D_CRT_SECURE_NO_WARNINGS", "-DHASHER_SUFFIX=portable", "-DSIMD_DEGREE=1" },
         });
     } else {
-        fy_c_lib.addCSourceFiles(.{
+        fy_c_lib.root_module.addCSourceFiles(.{
             .root = b.path("modules/libfyaml"),
             .files = &.{
                 "src/lib/fy-accel.c",
@@ -129,12 +129,12 @@ pub fn build(b: *std.Build) void {
             },
             .flags = &.{ "-std=c11", "-D_GNU_SOURCE" },
         });
-        fy_c_lib.addCSourceFiles(.{
+        fy_c_lib.root_module.addCSourceFiles(.{
             .root = b.path("."),
             .files = &.{"src/lib/fy_diag_shim.c"},
             .flags = &.{ "-std=c11", "-D_GNU_SOURCE" },
         });
-        fy_c_lib.addCSourceFiles(.{
+        fy_c_lib.root_module.addCSourceFiles(.{
             .root = b.path("modules/libfyaml"),
             .files = &.{
                 "src/blake3/blake3_portable.c",
@@ -145,7 +145,7 @@ pub fn build(b: *std.Build) void {
     }
 
     if (target.result.os.tag != .windows) {
-        fy_c_lib.linkSystemLibrary("pthread");
+        fy_c_lib.root_module.linkSystemLibrary("pthread", .{});
     }
 
     const lib_mod = b.addModule(
@@ -195,9 +195,9 @@ pub fn build(b: *std.Build) void {
             },
         ),
     });
-    docs_lib.linkLibrary(fy_c_lib);
-    docs_lib.addIncludePath(b.path("modules/libfyaml/include"));
-    docs_lib.addIncludePath(b.path("src/lib/fy_config"));
+    docs_lib.root_module.linkLibrary(fy_c_lib);
+    docs_lib.root_module.addIncludePath(b.path("modules/libfyaml/include"));
+    docs_lib.root_module.addIncludePath(b.path("src/lib/fy_config"));
 
     const docs = b.addInstallDirectory(.{
         .source_dir = docs_lib.getEmittedDocs(),
@@ -225,9 +225,9 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    integration_tests.linkLibrary(fy_c_lib);
-    integration_tests.addIncludePath(b.path("modules/libfyaml/include"));
-    integration_tests.addIncludePath(b.path("src/lib/fy_config"));
+    integration_tests.root_module.linkLibrary(fy_c_lib);
+    integration_tests.root_module.addIncludePath(b.path("modules/libfyaml/include"));
+    integration_tests.root_module.addIncludePath(b.path("src/lib/fy_config"));
 
     const run_integration_tests = b.addRunArtifact(integration_tests);
     tests_step.dependOn(&run_integration_tests.step);

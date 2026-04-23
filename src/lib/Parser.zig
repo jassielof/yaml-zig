@@ -1,17 +1,18 @@
 //! Parser that converts scanned lines into an event stream.
 const std = @import("std");
+
 const Error = @import("Error.zig");
+const EventModel = @import("Event.zig");
 const Options = @import("Options.zig");
 const Scanner = @import("Scanner.zig");
 const Token = @import("Token.zig");
-const EventModel = @import("Event.zig");
 
 pub const Parser = @This();
 
 allocator: std.mem.Allocator,
 scanned: Scanner.ScannedDocument,
 options: Options.Parse,
-events: std.ArrayListUnmanaged(EventModel.Event) = .{},
+events: std.ArrayListUnmanaged(EventModel.Event) = .empty,
 index: usize = 0,
 
 pub fn init(allocator: std.mem.Allocator, scanned: Scanner.ScannedDocument, options: Options.Parse) Parser {
@@ -54,7 +55,7 @@ pub fn parse(self: *Parser) ![]EventModel.Event {
     try self.pushSimple(.stream_end, .{});
 
     const owned = try self.events.toOwnedSlice(self.allocator);
-    self.events = .{};
+    self.events = .empty;
     return owned;
 }
 
@@ -203,7 +204,7 @@ fn parseBlockSequence(self: *Parser, indent: usize) anyerror!void {
         }
 
         // Nested sequence: value starts with "- "
-        const trimmed_val = std.mem.trimLeft(u8, line.value, " ");
+        const trimmed_val = std.mem.trimStart(u8, line.value, " ");
         if (trimmed_val.len >= 2 and trimmed_val[0] == '-' and (trimmed_val[1] == ' ' or trimmed_val[1] == '\t')) {
             const nested_indent = indent + 2;
             try self.events.append(self.allocator, .{
@@ -211,7 +212,7 @@ fn parseBlockSequence(self: *Parser, indent: usize) anyerror!void {
                 .data = .{ .sequence_start = .{ .style = .block } },
             });
             // Emit inline first item
-            const inner_item = std.mem.trimLeft(u8, trimmed_val[2..], " \t");
+            const inner_item = std.mem.trimStart(u8, trimmed_val[2..], " \t");
             if (inner_item.len == 0) {
                 self.index += 1;
                 if (self.index < self.scanned.lines.items.len and self.scanned.lines.items[self.index].indent > nested_indent) {
@@ -307,8 +308,8 @@ fn emitSequenceItemMapping(self: *Parser, line: Scanner.ScannedLine, seq_indent:
     }
 
     const col_idx = Scanner.findInlineMappingColon(working) orelse unreachable;
-    const key = std.mem.trimRight(u8, working[0..col_idx], " \t");
-    const raw_val = std.mem.trimLeft(u8, working[col_idx + 1 ..], " \t");
+    const key = std.mem.trimEnd(u8, working[0..col_idx], " \t");
+    const raw_val = std.mem.trimStart(u8, working[col_idx + 1 ..], " \t");
 
     try self.events.append(self.allocator, .{
         .kind = .mapping_start,
@@ -401,8 +402,8 @@ fn emitInlineMappingValue(self: *Parser, text: []const u8, parent_indent: usize,
     const anchor_info = extractLeadingAnchor(working);
     if (anchor_info.name.len > 0) working = anchor_info.rest;
     const col_idx = Scanner.findInlineMappingColon(working) orelse return;
-    const key = std.mem.trimRight(u8, working[0..col_idx], " \t");
-    const raw_val = std.mem.trimLeft(u8, working[col_idx + 1 ..], " \t");
+    const key = std.mem.trimEnd(u8, working[0..col_idx], " \t");
+    const raw_val = std.mem.trimStart(u8, working[col_idx + 1 ..], " \t");
 
     try self.events.append(self.allocator, .{
         .kind = .mapping_start,
@@ -421,13 +422,13 @@ fn emitInlineMappingValue(self: *Parser, text: []const u8, parent_indent: usize,
 }
 
 fn emitNestedSequenceValue(self: *Parser, value: []const u8, parent_indent: usize, line_no: usize, span: @import("Span.zig")) anyerror!void {
-    const trimmed = std.mem.trimLeft(u8, value, " ");
+    const trimmed = std.mem.trimStart(u8, value, " ");
     if (trimmed.len >= 2 and trimmed[0] == '-' and (trimmed[1] == ' ' or trimmed[1] == '\t')) {
         try self.events.append(self.allocator, .{
             .kind = .sequence_start,
             .data = .{ .sequence_start = .{ .style = .block } },
         });
-        const inner = std.mem.trimLeft(u8, trimmed[2..], " \t");
+        const inner = std.mem.trimStart(u8, trimmed[2..], " \t");
         if (inner.len == 0) {
             try self.pushScalar("null", .plain, null, span);
         } else if (inner.len >= 2 and inner[0] == '-' and (inner[1] == ' ' or inner[1] == '\t')) {
@@ -605,18 +606,18 @@ fn emitSingleMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_inden
                     if (next.kind == .mapping_entry and next.indent > parent_indent) {
                         if (isAliasToken(next.key)) |alias_name| {
                             if (isVirtualEmptyValue(next.value, next.style)) {
-                            const following = self.index + 1;
-                            const sole_entry = following >= self.scanned.lines.items.len or
-                                self.scanned.lines.items[following].indent != next.indent or
-                                self.scanned.lines.items[following].kind != .mapping_entry;
-                            if (sole_entry) {
-                                self.index += 1;
-                                try self.events.append(self.allocator, .{
-                                    .kind = .alias,
-                                    .data = .{ .alias = .{ .name = try self.allocator.dupe(u8, alias_name), .span = next.span } },
-                                });
-                                return;
-                            }
+                                const following = self.index + 1;
+                                const sole_entry = following >= self.scanned.lines.items.len or
+                                    self.scanned.lines.items[following].indent != next.indent or
+                                    self.scanned.lines.items[following].kind != .mapping_entry;
+                                if (sole_entry) {
+                                    self.index += 1;
+                                    try self.events.append(self.allocator, .{
+                                        .kind = .alias,
+                                        .data = .{ .alias = .{ .name = try self.allocator.dupe(u8, alias_name), .span = next.span } },
+                                    });
+                                    return;
+                                }
                             }
                         }
                     }
@@ -669,7 +670,7 @@ fn emitSingleMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_inden
     if (line.style == .plain and line.value.len > 0) {
         const after_tag = stripTagPrefix(std.mem.trim(u8, line.value, " "));
         const after_anchor = stripAnchorPrefix(after_tag);
-        const trimmed_after = std.mem.trimLeft(u8, after_anchor, " ");
+        const trimmed_after = std.mem.trimStart(u8, after_anchor, " ");
         if (trimmed_after.len > 0 and (trimmed_after[0] == '|' or trimmed_after[0] == '>')) {
             const bs_style: Token.ScalarStyle = if (trimmed_after[0] == '|') .literal else .folded;
             const block = try self.collectBlockScalar(line.indent, bs_style, trimmed_after, line.line_no);
@@ -683,7 +684,7 @@ fn emitSingleMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_inden
     if (line.style == .plain and line.value.len > 0) {
         const after_tag2 = stripTagPrefix(std.mem.trim(u8, line.value, " "));
         const after_anchor2 = stripAnchorPrefix(after_tag2);
-        const trimmed_after2 = std.mem.trimLeft(u8, after_anchor2, " ");
+        const trimmed_after2 = std.mem.trimStart(u8, after_anchor2, " ");
         if (trimmed_after2.len > 0 and (trimmed_after2[0] == '"' or trimmed_after2[0] == '\'')) {
             const qs: Token.ScalarStyle = if (trimmed_after2[0] == '"') .double_quoted else .single_quoted;
             const quote2: u8 = trimmed_after2[0];
@@ -736,7 +737,7 @@ fn collectBlockScalar(
     self.index += 1;
 
     // Build raw line index from source
-    var raw_lines: std.ArrayListUnmanaged([]const u8) = .{};
+    var raw_lines: std.ArrayListUnmanaged([]const u8) = .empty;
     defer raw_lines.deinit(self.allocator);
     {
         var split = std.mem.splitScalar(u8, self.scanned.source, '\n');
@@ -786,7 +787,7 @@ fn collectBlockScalar(
 
     const bi = base_indent orelse (parent_indent + 1);
 
-    var out: std.ArrayListUnmanaged(u8) = .{};
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(self.allocator);
 
     if (style == .literal) {
@@ -896,7 +897,7 @@ fn parseScalarLikeValue(
         const before_tag = working;
         working = stripTagPrefix(working);
         if (!std.mem.eql(u8, before_tag, working)) {
-            const trimmed_bt = std.mem.trimLeft(u8, before_tag, " ");
+            const trimmed_bt = std.mem.trimStart(u8, before_tag, " ");
             if (std.mem.startsWith(u8, trimmed_bt, "! ") or std.mem.eql(u8, trimmed_bt, "!")) {
                 has_nonspecific_tag = true;
             }
@@ -912,7 +913,7 @@ fn parseScalarLikeValue(
         const before_tag2 = working;
         working = stripTagPrefix(working);
         if (!std.mem.eql(u8, before_tag2, working)) {
-            const trimmed_bt2 = std.mem.trimLeft(u8, before_tag2, " ");
+            const trimmed_bt2 = std.mem.trimStart(u8, before_tag2, " ");
             if (!has_nonspecific_tag and (std.mem.startsWith(u8, trimmed_bt2, "! ") or std.mem.eql(u8, trimmed_bt2, "!"))) {
                 has_nonspecific_tag = true;
             }
@@ -967,8 +968,8 @@ fn parseScalarLikeValue(
 
     if (working_style == .plain) {
         if (Scanner.findInlineMappingColon(working)) |idx| {
-            const key = std.mem.trimRight(u8, working[0..idx], " ");
-            const raw_val = std.mem.trimLeft(u8, working[idx + 1 ..], " ");
+            const key = std.mem.trimEnd(u8, working[0..idx], " ");
+            const raw_val = std.mem.trimStart(u8, working[idx + 1 ..], " ");
             if (key.len > 0) {
                 try self.events.append(self.allocator, .{
                     .kind = .mapping_start,
@@ -1070,7 +1071,7 @@ fn normalizeScalar(allocator: std.mem.Allocator, raw: []const u8, style: Token.S
     switch (style) {
         .single_quoted => {
             const inner = stripOuterQuotes(raw, '\'');
-            var out: std.ArrayListUnmanaged(u8) = .{};
+            var out: std.ArrayListUnmanaged(u8) = .empty;
             defer out.deinit(allocator);
             var i: usize = 0;
             while (i < inner.len) : (i += 1) {
@@ -1085,7 +1086,7 @@ fn normalizeScalar(allocator: std.mem.Allocator, raw: []const u8, style: Token.S
         },
         .double_quoted => {
             const inner = stripOuterQuotes(raw, '"');
-            var out: std.ArrayListUnmanaged(u8) = .{};
+            var out: std.ArrayListUnmanaged(u8) = .empty;
             defer out.deinit(allocator);
             var i: usize = 0;
             while (i < inner.len) : (i += 1) {
@@ -1164,7 +1165,7 @@ fn stripOuterQuotes(raw: []const u8, quote: u8) []const u8 {
 }
 
 fn stripTagPrefix(raw: []const u8) []const u8 {
-    var value = std.mem.trimLeft(u8, raw, " ");
+    var value = std.mem.trimStart(u8, raw, " ");
     while (value.len > 1 and value[0] == '!' and !std.mem.startsWith(u8, value, "!=")) {
         var i: usize = 1;
         if (i < value.len and value[i] == '<') {
@@ -1174,13 +1175,13 @@ fn stripTagPrefix(raw: []const u8) []const u8 {
         } else {
             while (i < value.len and !isSpace(value[i])) : (i += 1) {}
         }
-        value = std.mem.trimLeft(u8, value[i..], " ");
+        value = std.mem.trimStart(u8, value[i..], " ");
     }
     return value;
 }
 
 fn stripAnchorPrefix(raw: []const u8) []const u8 {
-    var value = std.mem.trimLeft(u8, raw, " ");
+    var value = std.mem.trimStart(u8, raw, " ");
     while (value.len > 1 and value[0] == '&') {
         var i: usize = 1;
         while (i < value.len) : (i += 1) {
@@ -1189,13 +1190,13 @@ fn stripAnchorPrefix(raw: []const u8) []const u8 {
             if (!Scanner.isBlockAnchorChar(c)) break;
         }
         if (i <= 1) break;
-        value = std.mem.trimLeft(u8, value[i..], " :\t");
+        value = std.mem.trimStart(u8, value[i..], " :\t");
     }
     return value;
 }
 
 fn extractLeadingAnchor(raw: []const u8) struct { name: []const u8, rest: []const u8 } {
-    var value = std.mem.trimLeft(u8, raw, " ");
+    var value = std.mem.trimStart(u8, raw, " ");
     if (value.len <= 1 or value[0] != '&') return .{ .name = "", .rest = raw };
 
     var i: usize = 1;
@@ -1209,7 +1210,7 @@ fn extractLeadingAnchor(raw: []const u8) struct { name: []const u8, rest: []cons
 
     const name = value[1..i];
     // Strip optional ": " after anchor (e.g. "&a: key" -> key)
-    value = std.mem.trimLeft(u8, value[i..], " :\t");
+    value = std.mem.trimStart(u8, value[i..], " :\t");
     return .{ .name = name, .rest = value };
 }
 
@@ -1222,7 +1223,7 @@ fn isVirtualEmptyValue(value: []const u8, style: Token.ScalarStyle) bool {
 }
 
 fn collectPlainContinuation(self: *Parser, min_indent: usize, initial: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .{};
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(self.allocator);
 
     try out.appendSlice(self.allocator, std.mem.trim(u8, initial, " "));
@@ -1251,7 +1252,7 @@ fn collectPlainContinuation(self: *Parser, min_indent: usize, initial: []const u
 }
 
 fn collectMultilineQuotedScalar(self: *Parser, base_indent: usize, style: Token.ScalarStyle) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .{};
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(self.allocator);
 
     const quote: u8 = if (style == .double_quoted) '"' else '\'';
@@ -1271,10 +1272,10 @@ fn collectMultilineQuotedScalar(self: *Parser, base_indent: usize, style: Token.
 
         if (style == .double_quoted and hasTrailingEscapedNewline(out.items)) {
             _ = out.pop();
-            const trimmed = std.mem.trimLeft(u8, line.value, " \t");
+            const trimmed = std.mem.trimStart(u8, line.value, " \t");
             try out.appendSlice(self.allocator, trimmed);
         } else {
-            const trimmed = std.mem.trimLeft(u8, std.mem.trim(u8, line.value, " \t"), " \t");
+            const trimmed = std.mem.trimStart(u8, std.mem.trim(u8, line.value, " \t"), " \t");
             const doc_end = trimDocEndLine(trimmed, style);
             if (gap > 0) {
                 var g: usize = 0;
@@ -1297,7 +1298,7 @@ fn collectMultilineQuotedScalar(self: *Parser, base_indent: usize, style: Token.
 }
 
 fn collectMultilineQuotedValue(self: *Parser, base_indent: usize, initial: []const u8, style: Token.ScalarStyle) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .{};
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(self.allocator);
 
     const quote: u8 = if (style == .double_quoted) '"' else '\'';
@@ -1315,10 +1316,10 @@ fn collectMultilineQuotedValue(self: *Parser, base_indent: usize, initial: []con
 
         if (style == .double_quoted and hasTrailingEscapedNewline(out.items)) {
             _ = out.pop();
-            const trimmed = std.mem.trimLeft(u8, line.value, " \t");
+            const trimmed = std.mem.trimStart(u8, line.value, " \t");
             try out.appendSlice(self.allocator, trimmed);
         } else {
-            const trimmed = std.mem.trimLeft(u8, std.mem.trim(u8, line.value, " \t"), " \t");
+            const trimmed = std.mem.trimStart(u8, std.mem.trim(u8, line.value, " \t"), " \t");
             const doc_end = trimDocEndLine(trimmed, style);
             if (gap > 0) {
                 var g: usize = 0;
@@ -1346,7 +1347,7 @@ fn trimDocEndLine(content: []const u8, style: Token.ScalarStyle) struct { prefix
     if (!std.mem.eql(u8, content[0..3], "...")) return .{ .prefix = "", .rest = content };
     if (content.len == 3) return .{ .prefix = "", .rest = content };
     if (content[3] != ' ') return .{ .prefix = "", .rest = content };
-    return .{ .prefix = "...", .rest = std.mem.trimLeft(u8, content[3..], " ") };
+    return .{ .prefix = "...", .rest = std.mem.trimStart(u8, content[3..], " ") };
 }
 
 fn stripTrailingQuoteWs(out: *std.ArrayListUnmanaged(u8), style: Token.ScalarStyle) void {

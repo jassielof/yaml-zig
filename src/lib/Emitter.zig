@@ -13,7 +13,7 @@ pub fn init(allocator: std.mem.Allocator, options: Options.Stringify) Emitter {
     return .{
         .allocator = allocator,
         .options = options,
-        .buffer = .{},
+        .buffer = .empty,
     };
 }
 
@@ -159,6 +159,8 @@ fn needsQuotes(text: []const u8) bool {
             return true;
         }
     }
+
     if (text[0] == '-' or text[0] == '?' or text[0] == '!' or text[0] == '&' or text[0] == '*') return true;
+
     return false;
 }

@@ -207,9 +207,7 @@ fn runFixtureSemanticCheck(backend: Backend, id: []const u8) !void {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Verbose report
-// ---------------------------------------------------------------------------
 
 fn printVerboseReport(backend: Backend, outcomes: []const FixtureOutcome) void {
     std.debug.print("\n", .{});
@@ -654,21 +652,28 @@ fn backendName(backend: Backend) []const u8 {
     };
 }
 
-// ---------------------------------------------------------------------------
 // Helpers
-// ---------------------------------------------------------------------------
 
 fn collectFixtureCaseIds(allocator: std.mem.Allocator) !std.ArrayListUnmanaged([]const u8) {
-    var dir = try std.fs.cwd().openDir("tests/fixtures", .{
-        .iterate = true,
-        .access_sub_paths = true,
-    });
-    defer dir.close();
+    var io_impl: std.Io.Threaded = .init(allocator, .{});
+    defer io_impl.deinit();
+
+    const io = io_impl.io();
+    const cwd = std.Io.Dir.cwd();
+    var dir = try cwd.openDir(
+        io,
+        "tests/fixtures",
+        .{
+            .iterate = true,
+            .access_sub_paths = true,
+        },
+    );
+    defer dir.close(io);
 
     var walker = try dir.walk(allocator);
     defer walker.deinit();
 
-    var ids: std.ArrayListUnmanaged([]const u8) = .{};
+    var ids: std.ArrayListUnmanaged([]const u8) = .empty;
     errdefer deinitStringList(allocator, &ids);
 
     while (try walker.next()) |entry| {

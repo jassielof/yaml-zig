@@ -1,9 +1,10 @@
 //! YAML scanning phase.
 const std = @import("std");
+
 const Error = @import("Error.zig");
 const Mark = @import("Mark.zig");
-const Span = @import("Span.zig");
 const Options = @import("Options.zig");
+const Span = @import("Span.zig");
 const TokenModel = @import("Token.zig");
 
 pub const LineKind = enum {
@@ -38,7 +39,7 @@ pub const Scanner = @This();
 allocator: std.mem.Allocator,
 source: []const u8,
 options: Options.Parse,
-lines: std.ArrayListUnmanaged(ScannedLine) = .{},
+lines: std.ArrayListUnmanaged(ScannedLine) = .empty,
 
 pub fn init(allocator: std.mem.Allocator, source: []const u8, options: Options.Parse) Scanner {
     return .{
@@ -61,14 +62,14 @@ pub fn scan(self: *Scanner) !ScannedDocument {
     while (split.next()) |raw_line| : (line_no += 1) {
         const line = stripCarriageReturn(raw_line);
         const indent = try countIndent(line);
-        var content = stripInlineComment(std.mem.trimLeft(u8, line[indent..], " "));
+        var content = stripInlineComment(std.mem.trimStart(u8, line[indent..], " "));
         if (content.len == 0 or std.mem.startsWith(u8, content, "#")) continue;
         if (!past_doc_start and content[0] == '%') continue;
         // Document start "---" only when followed by space, tab, or end (not plain scalar like "---word1")
         if (content.len >= 3 and std.mem.eql(u8, content[0..3], "---")) {
             if (content.len == 3 or content[3] == ' ' or content[3] == '\t') {
                 past_doc_start = true;
-                content = std.mem.trimLeft(u8, content[3..], " \t");
+                content = std.mem.trimStart(u8, content[3..], " \t");
                 if (content.len == 0) continue;
             }
         }
@@ -81,7 +82,7 @@ pub fn scan(self: *Scanner) !ScannedDocument {
             const sequence_value = if (content.len == 1)
                 ""
             else
-                stripInlineComment(std.mem.trimLeft(u8, content[2..], " \t"));
+                stripInlineComment(std.mem.trimStart(u8, content[2..], " \t"));
             try self.lines.append(self.allocator, .{
                 .line_no = line_no,
                 .indent = indent,
@@ -114,9 +115,9 @@ pub fn scan(self: *Scanner) !ScannedDocument {
         }
 
         if (findMappingColon(content)) |idx| {
-            const key = std.mem.trimRight(u8, content[0..idx], " \t");
+            const key = std.mem.trimEnd(u8, content[0..idx], " \t");
             if (key.len == 0) return Error.Parse.InvalidMappingKey;
-            const value = stripInlineComment(std.mem.trimLeft(u8, content[idx + 1 ..], " \t"));
+            const value = stripInlineComment(std.mem.trimStart(u8, content[idx + 1 ..], " \t"));
             try self.lines.append(self.allocator, .{
                 .line_no = line_no,
                 .indent = indent,
@@ -141,7 +142,7 @@ pub fn scan(self: *Scanner) !ScannedDocument {
     }
 
     const result_lines = self.lines;
-    self.lines = .{};
+    self.lines = .empty;
     return .{
         .source = self.source,
         .lines = result_lines,
@@ -154,7 +155,7 @@ pub fn tokenizeFlow(
     line_no: usize,
     column_base: usize,
 ) ![]TokenModel.Token {
-    var out: std.ArrayListUnmanaged(TokenModel.Token) = .{};
+    var out: std.ArrayListUnmanaged(TokenModel.Token) = .empty;
     defer out.deinit(allocator);
 
     var i: usize = 0;
@@ -325,7 +326,7 @@ fn findMappingColon(text: []const u8) ?usize {
             ':' => {
                 if (!in_single and !in_double and depth_square == 0 and depth_curly == 0) {
                     if (idx + 1 >= text.len or text[idx + 1] == ' ' or text[idx + 1] == '\t') {
-                        const after = std.mem.trimLeft(u8, text[idx + 1 ..], " \t");
+                        const after = std.mem.trimEnd(u8, text[idx + 1 ..], " \t");
                         if (after.len > 0 and (after[0] == '&' or after[0] == '*')) {
                             return idx;
                         }
@@ -376,7 +377,7 @@ fn stripInlineComment(text: []const u8) []const u8 {
             '#' => {
                 if (!in_single and !in_double and depth_square == 0 and depth_curly == 0) {
                     if (idx == 0 or text[idx - 1] == ' ' or text[idx - 1] == '\t') {
-                        return std.mem.trimRight(u8, text[0..idx], " \t");
+                        return std.mem.trimStart(u8, text[0..idx], " \t");
                     }
                 }
             },
@@ -384,7 +385,7 @@ fn stripInlineComment(text: []const u8) []const u8 {
         }
     }
     if (in_single or in_double) return text;
-    return std.mem.trimRight(u8, text, " \t");
+    return std.mem.trimStart(u8, text, " \t");
 }
 
 fn isFlowDelimiter(c: u8) bool {
