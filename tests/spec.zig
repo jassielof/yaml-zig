@@ -1,5 +1,6 @@
 const std = @import("std");
 const testing = std.testing;
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 
 const fy = @import("fy");
@@ -31,6 +32,7 @@ test "yaml-test-suite coverage across all fixture cases" {
 }
 
 test "yaml-test-suite coverage across all fixture cases via fy" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     try runSpecCoverage(.fy);
 }
 
@@ -40,7 +42,7 @@ fn runSpecCoverage(backend: Backend) !void {
     var fixture_ids = try collectFixtureCaseIds(testing.allocator);
     defer deinitStringList(testing.allocator, &fixture_ids);
 
-    var outcomes: std.ArrayListUnmanaged(FixtureOutcome) = .{};
+    var outcomes: std.ArrayListUnmanaged(FixtureOutcome) = .empty;
     defer {
         for (outcomes.items) |o| testing.allocator.free(o.id);
         outcomes.deinit(testing.allocator);
@@ -50,11 +52,11 @@ fn runSpecCoverage(backend: Backend) !void {
         try outcomes.append(testing.allocator, classifyFixture(backend, id));
     }
 
-    var passed_ids: std.ArrayListUnmanaged([]const u8) = .{};
+    var passed_ids: std.ArrayListUnmanaged([]const u8) = .empty;
     defer passed_ids.deinit(testing.allocator);
-    var unsupported_ids: std.ArrayListUnmanaged([]const u8) = .{};
+    var unsupported_ids: std.ArrayListUnmanaged([]const u8) = .empty;
     defer unsupported_ids.deinit(testing.allocator);
-    var failed_ids: std.ArrayListUnmanaged([]const u8) = .{};
+    var failed_ids: std.ArrayListUnmanaged([]const u8) = .empty;
     defer failed_ids.deinit(testing.allocator);
 
     for (outcomes.items) |o| {
@@ -246,7 +248,7 @@ fn printVerboseReport(backend: Backend, outcomes: []const FixtureOutcome) void {
         for (outcomes) |o| {
             if (o.class != .unsupported) continue;
             const result = groups.getOrPut(o.err_name) catch continue;
-            if (!result.found_existing) result.value_ptr.* = .{};
+            if (!result.found_existing) result.value_ptr.* = .empty;
             result.value_ptr.append(testing.allocator, o.id) catch continue;
         }
 
@@ -676,7 +678,7 @@ fn collectFixtureCaseIds(allocator: std.mem.Allocator) !std.ArrayListUnmanaged([
     var ids: std.ArrayListUnmanaged([]const u8) = .empty;
     errdefer deinitStringList(allocator, &ids);
 
-    while (try walker.next()) |entry| {
+    while (try walker.next(io)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.eql(u8, std.fs.path.basename(entry.path), "===")) continue;
 
@@ -697,7 +699,12 @@ fn lessString(_: void, lhs: []const u8, rhs: []const u8) bool {
 }
 
 fn pathExists(path: []const u8) !bool {
-    std.fs.cwd().access(path, .{}) catch |err| switch (err) {
+    var io_impl: std.Io.Threaded = .init(testing.allocator, .{});
+    defer io_impl.deinit();
+
+    const io = io_impl.io();
+    const cwd = std.Io.Dir.cwd();
+    cwd.access(io, path, .{}) catch |err| switch (err) {
         error.FileNotFound => return false,
         else => return err,
     };
@@ -705,15 +712,21 @@ fn pathExists(path: []const u8) !bool {
 }
 
 fn writeCoverageJson(backend: Backend, report: CoverageReport) !void {
-    try std.fs.cwd().makePath("zig-out/spec-coverage");
+    var io_impl: std.Io.Threaded = .init(testing.allocator, .{});
+    defer io_impl.deinit();
+
+    const io = io_impl.io();
+    const cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(io, "zig-out/spec-coverage");
     const path = switch (backend) {
         .yaml => "zig-out/spec-coverage/coverage.json",
         .fy => "zig-out/spec-coverage/coverage-fy.json",
     };
-    const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
-    defer file.close();
+    const file = try cwd.createFile(io, path, .{ .truncate = true });
+    defer file.close(io);
 
-    var writer = file.writer(&.{});
+    var writer_buffer: [4096]u8 = undefined;
+    var writer = file.writer(io, &writer_buffer);
     defer writer.end() catch {};
 
     try std.json.Stringify.value(report, .{ .whitespace = .indent_2 }, &writer.interface);
@@ -770,13 +783,16 @@ fn deinitStringList(allocator: std.mem.Allocator, list: *std.ArrayListUnmanaged(
 }
 
 fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
-    return file.readToEndAlloc(allocator, std.math.maxInt(u32));
+    var io_impl: std.Io.Threaded = .init(allocator, .{});
+    defer io_impl.deinit();
+
+    const io = io_impl.io();
+    const cwd = std.Io.Dir.cwd();
+    return cwd.readFileAlloc(io, path, allocator, .limited(std.math.maxInt(u32)));
 }
 
 fn stripCarriageReturnsAlloc(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
-    var output: std.ArrayListUnmanaged(u8) = .{};
+    var output: std.ArrayListUnmanaged(u8) = .empty;
     errdefer output.deinit(allocator);
 
     for (input) |ch| {

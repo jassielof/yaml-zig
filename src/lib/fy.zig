@@ -1,30 +1,31 @@
 //! Zig wrapper around the vendored libfyaml C library.
 const std = @import("std");
+const builtin = @import("builtin");
 
-pub const c = @cImport({
-    @cInclude("stdlib.h");
-    @cInclude("libfyaml.h");
-});
-
-const list_head = extern struct {
-    next: ?*list_head,
-    prev: ?*list_head,
+pub const c = if (builtin.os.tag == .windows) blk: {
+    // Stub for Windows
+    break :blk struct {
+        pub const struct_fy_parser = opaque {};
+        pub const struct_fy_event = opaque {};
+        pub const struct_fy_diag = opaque {};
+        pub const struct_fy_document = opaque {};
+        pub const struct_fy_node = opaque {};
+        pub const struct_fy_token = opaque {};
+    };
+} else blk: {
+    break :blk @cImport({
+        @cInclude("config.h");
+        @cInclude("stdlib.h");
+        @cInclude("libfyaml.h");
+    });
 };
-
-const fy_eventp = extern struct {
-    node: list_head,
-    e: c.struct_fy_event,
-};
-
-extern fn fy_parse_private(fyp: *c.struct_fy_parser) ?*fy_eventp;
-extern fn fy_parse_eventp_recycle(fyp: *c.struct_fy_parser, fyep: *fy_eventp) void;
-extern fn fyz_create_silent_diag() ?*c.struct_fy_diag;
 
 pub const Error = error{
     ParseFailed,
     EmitFailed,
     EventFormatFailed,
     OutOfMemory,
+    UnsupportedOnWindows,
 };
 
 pub const TestsuiteParseResult = struct {
@@ -33,17 +34,21 @@ pub const TestsuiteParseResult = struct {
 };
 
 pub const Document = struct {
-    raw: *c.struct_fy_document,
+    raw: if (builtin.os.tag == .windows) void else *c.struct_fy_document,
 
     pub fn deinit(self: *Document) void {
-        c.fy_document_destroy(self.raw);
+        if (builtin.os.tag != .windows) {
+            c.fy_document_destroy(self.raw);
+        }
     }
 
     pub fn root(self: *Document) ?*c.struct_fy_node {
+        if (builtin.os.tag == .windows) return null;
         return c.fy_document_root(self.raw);
     }
 
     pub fn emitJsonAlloc(self: *Document, allocator: std.mem.Allocator) Error![]u8 {
+        if (builtin.os.tag == .windows) return error.UnsupportedOnWindows;
         const emitted = c.fy_emit_document_to_string(self.raw, c.FYECF_MODE_JSON) orelse {
             return error.EmitFailed;
         };
@@ -54,6 +59,8 @@ pub const Document = struct {
 };
 
 pub fn parseDocument(source: []const u8) Error!Document {
+    if (builtin.os.tag == .windows) return error.UnsupportedOnWindows;
+
     var cfg = std.mem.zeroes(c.struct_fy_parse_cfg);
     cfg.flags = @as(@TypeOf(cfg.flags), c.FYPCF_QUIET | c.FYPCF_RESOLVE_DOCUMENT);
     const diag = fyz_create_silent_diag();
@@ -68,11 +75,14 @@ pub fn parseDocument(source: []const u8) Error!Document {
 }
 
 pub fn parseTestsuiteEventsAlloc(allocator: std.mem.Allocator, source: []const u8) Error![]u8 {
+    if (builtin.os.tag == .windows) return error.UnsupportedOnWindows;
     const result = try parseTestsuiteEventsDetailedAlloc(allocator, source);
     return result.events;
 }
 
 pub fn parseTestsuiteEventsDetailedAlloc(allocator: std.mem.Allocator, source: []const u8) Error!TestsuiteParseResult {
+    if (builtin.os.tag == .windows) return error.UnsupportedOnWindows;
+
     var cfg = std.mem.zeroes(c.struct_fy_parse_cfg);
     cfg.flags = @as(@TypeOf(cfg.flags), c.FYPCF_QUIET);
     const diag = fyz_create_silent_diag();
@@ -86,7 +96,7 @@ pub fn parseTestsuiteEventsDetailedAlloc(allocator: std.mem.Allocator, source: [
         return error.ParseFailed;
     }
 
-    var output: std.ArrayListUnmanaged(u8) = .{};
+    var output: std.ArrayListUnmanaged(u8) = .empty;
     errdefer output.deinit(allocator);
 
     while (true) {
@@ -102,6 +112,28 @@ pub fn parseTestsuiteEventsDetailedAlloc(allocator: std.mem.Allocator, source: [
         .had_stream_error = c.fy_parser_get_stream_error(parser),
     };
 }
+
+// C binding types (real on non-Windows, stubs on Windows)
+const fy_list_head_type = if (builtin.os.tag == .windows)
+    opaque {}
+else
+    extern struct {
+        next: ?*@This(),
+        prev: ?*@This(),
+    };
+
+const fy_eventp_type = if (builtin.os.tag == .windows)
+    opaque {}
+else
+    extern struct {
+        node: fy_list_head_type,
+        e: c.struct_fy_event,
+    };
+
+// C extern declarations
+extern "c" fn fy_parse_private(fyp: *c.struct_fy_parser) ?*fy_eventp_type;
+extern "c" fn fy_parse_eventp_recycle(fyp: *c.struct_fy_parser, fyep: *fy_eventp_type) void;
+extern "c" fn fyz_create_silent_diag() ?*c.struct_fy_diag;
 
 fn appendTestsuiteEvent(
     allocator: std.mem.Allocator,

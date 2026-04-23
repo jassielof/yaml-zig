@@ -1,6 +1,17 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
+/* Windows compatibility for sys/uio.h */
+#ifdef _WIN32
+#ifndef _SYS_UIO_H_
+#define _SYS_UIO_H_
+struct iovec {
+  void *iov_base;
+  size_t iov_len;
+};
+#endif
+#endif
+
 #if defined(__has_include)
 #if __has_include(<alloca.h>)
 #define HAVE_ALLOCA_H 1
