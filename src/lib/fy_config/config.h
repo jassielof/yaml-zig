@@ -50,6 +50,6 @@ struct iovec {
 #define HAVE_CLANG_BLOCKS 0
 #define HAVE_HEAP_TRAMPOLINES 0
 
-#define VERSION "vendored"
+#define VERSION "0.9.6"
 
 #endif

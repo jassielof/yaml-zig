@@ -90,6 +90,10 @@ pub fn create(b: *std.Build, options: Options) Dependency {
     if (options.target.result.os.tag != .windows) {
         c_lib.root_module.linkSystemLibrary("pthread", .{});
     }
+    switch (options.target.result.os.tag) {
+        .linux, .freebsd, .netbsd, .openbsd, .dragonfly => c_lib.root_module.linkSystemLibrary("m", .{}),
+        else => {},
+    }
 
     const translate_c = b.addTranslateC(.{
         .root_source_file = b.path("src/lib/fy_c.h"),

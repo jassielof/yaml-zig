@@ -11,12 +11,6 @@ pub fn build(b: *std.Build) void {
 
     const summary_only = b.option(bool, "summary", "Only print short coverage summary (useful for CI)") orelse false;
 
-    const fy_dep = fy.create(b, .{
-        .module_name = fy_mod_name,
-        .target = target,
-        .optimize = optimize,
-    });
-
     const lib_mod = b.addModule(
         mod_name,
         .{
@@ -25,6 +19,12 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         },
     );
+
+    const fy_dep = fy.create(b, .{
+        .module_name = fy_mod_name,
+        .target = target,
+        .optimize = optimize,
+    });
 
     const docs_step = b.step("docs", "Generate the documentation");
 
