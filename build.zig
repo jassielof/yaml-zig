@@ -157,6 +157,20 @@ pub fn build(b: *std.Build) void {
         },
     );
 
+    const fy_translate_c = b.addTranslateC(.{
+        .root_source_file = b.path("src/lib/fy_c.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    fy_translate_c.addIncludePath(b.path("modules/libfyaml/include"));
+    fy_translate_c.addIncludePath(b.path("modules/libfyaml/src/lib"));
+    fy_translate_c.addIncludePath(b.path("modules/libfyaml/src/util"));
+    fy_translate_c.addIncludePath(b.path("modules/libfyaml/src/xxhash"));
+    fy_translate_c.addIncludePath(b.path("modules/libfyaml/src/thread"));
+    fy_translate_c.addIncludePath(b.path("modules/libfyaml/src/allocator"));
+    fy_translate_c.addIncludePath(b.path("modules/libfyaml/src/blake3"));
+    fy_translate_c.addIncludePath(b.path("src/lib/fy_config"));
+
     const fy_mod = b.addModule(
         fy_mod_name,
         .{
@@ -164,17 +178,14 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .link_libc = true,
+            .imports = &.{
+                .{
+                    .name = "fy_c",
+                    .module = fy_translate_c.createModule(),
+                },
+            },
         },
     );
-
-    fy_mod.addIncludePath(b.path("modules/libfyaml/include"));
-    fy_mod.addIncludePath(b.path("modules/libfyaml/src/lib"));
-    fy_mod.addIncludePath(b.path("modules/libfyaml/src/util"));
-    fy_mod.addIncludePath(b.path("modules/libfyaml/src/xxhash"));
-    fy_mod.addIncludePath(b.path("modules/libfyaml/src/thread"));
-    fy_mod.addIncludePath(b.path("modules/libfyaml/src/allocator"));
-    fy_mod.addIncludePath(b.path("modules/libfyaml/src/blake3"));
-    fy_mod.addIncludePath(b.path("src/lib/fy_config"));
 
     const docs_step = b.step("docs", "Generate the documentation");
 

@@ -1,11 +1,7 @@
 //! Zig wrapper around the vendored libfyaml C library.
 const std = @import("std");
 
-pub const c = @cImport({
-    @cInclude("config.h");
-    @cInclude("stdlib.h");
-    @cInclude("libfyaml.h");
-});
+pub const c = @import("fy_c");
 
 pub const Error = error{
     ParseFailed,
