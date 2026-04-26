@@ -101,6 +101,7 @@ pub fn create(b: *std.Build, options: Options) Dependency {
         .optimize = options.optimize,
     });
     addTranslateIncludePaths(translate_c, options.target);
+    addTranslateDefines(translate_c, options.target);
 
     const module = b.addModule(
         options.module_name,
@@ -141,6 +142,17 @@ fn addTranslateIncludePaths(translate_c: *std.Build.Step.TranslateC, target: std
     }
     if (target.result.os.tag == .windows) {
         translate_c.addIncludePath(b.path("src/lib/fy_windows"));
+    }
+}
+
+fn addTranslateDefines(translate_c: *std.Build.Step.TranslateC, target: std.Build.ResolvedTarget) void {
+    translate_c.defineCMacroRaw("HAVE_CONFIG_H");
+    if (target.result.os.tag == .windows) {
+        translate_c.defineCMacroRaw("WIN32_LEAN_AND_MEAN");
+        translate_c.defineCMacroRaw("_CRT_SECURE_NO_WARNINGS");
+        translate_c.defineCMacroRaw("_FORTIFY_SOURCE=0");
+    } else {
+        translate_c.defineCMacroRaw("_GNU_SOURCE");
     }
 }
 

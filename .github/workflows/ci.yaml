@@ -57,7 +57,7 @@ jobs:
         uses: jassielof/setup-zig@v1
 
       - name: Tests
-        run: zig build --summary all tests -Doptimize=ReleaseSafe -Dsummary=true
+        run: zig build --summary all tests -Dsummary=true
 
       - name: Setup Python
         if: always()
