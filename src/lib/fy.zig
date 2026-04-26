@@ -1,31 +1,17 @@
 //! Zig wrapper around the vendored libfyaml C library.
 const std = @import("std");
-const builtin = @import("builtin");
 
-pub const c = if (builtin.os.tag == .windows) blk: {
-    // Stub for Windows
-    break :blk struct {
-        pub const struct_fy_parser = opaque {};
-        pub const struct_fy_event = opaque {};
-        pub const struct_fy_diag = opaque {};
-        pub const struct_fy_document = opaque {};
-        pub const struct_fy_node = opaque {};
-        pub const struct_fy_token = opaque {};
-    };
-} else blk: {
-    break :blk @cImport({
-        @cInclude("config.h");
-        @cInclude("stdlib.h");
-        @cInclude("libfyaml.h");
-    });
-};
+pub const c = @cImport({
+    @cInclude("config.h");
+    @cInclude("stdlib.h");
+    @cInclude("libfyaml.h");
+});
 
 pub const Error = error{
     ParseFailed,
     EmitFailed,
     EventFormatFailed,
     OutOfMemory,
-    UnsupportedOnWindows,
 };
 
 pub const TestsuiteParseResult = struct {
@@ -34,21 +20,17 @@ pub const TestsuiteParseResult = struct {
 };
 
 pub const Document = struct {
-    raw: if (builtin.os.tag == .windows) void else *c.struct_fy_document,
+    raw: *c.struct_fy_document,
 
     pub fn deinit(self: *Document) void {
-        if (builtin.os.tag != .windows) {
-            c.fy_document_destroy(self.raw);
-        }
+        c.fy_document_destroy(self.raw);
     }
 
     pub fn root(self: *Document) ?*c.struct_fy_node {
-        if (builtin.os.tag == .windows) return null;
         return c.fy_document_root(self.raw);
     }
 
     pub fn emitJsonAlloc(self: *Document, allocator: std.mem.Allocator) Error![]u8 {
-        if (builtin.os.tag == .windows) return error.UnsupportedOnWindows;
         const emitted = c.fy_emit_document_to_string(self.raw, c.FYECF_MODE_JSON) orelse {
             return error.EmitFailed;
         };
@@ -59,8 +41,6 @@ pub const Document = struct {
 };
 
 pub fn parseDocument(source: []const u8) Error!Document {
-    if (builtin.os.tag == .windows) return error.UnsupportedOnWindows;
-
     var cfg = std.mem.zeroes(c.struct_fy_parse_cfg);
     cfg.flags = @as(@TypeOf(cfg.flags), c.FYPCF_QUIET | c.FYPCF_RESOLVE_DOCUMENT);
     const diag = fyz_create_silent_diag();
@@ -75,13 +55,17 @@ pub fn parseDocument(source: []const u8) Error!Document {
 }
 
 pub fn parseTestsuiteEventsAlloc(allocator: std.mem.Allocator, source: []const u8) Error![]u8 {
-    if (builtin.os.tag == .windows) return error.UnsupportedOnWindows;
     const result = try parseTestsuiteEventsDetailedAlloc(allocator, source);
     return result.events;
 }
 
 pub fn parseTestsuiteEventsDetailedAlloc(allocator: std.mem.Allocator, source: []const u8) Error!TestsuiteParseResult {
-    if (builtin.os.tag == .windows) return error.UnsupportedOnWindows;
+    if (source.len == 0) {
+        return .{
+            .events = try allocator.dupe(u8, "+STR\n-STR\n"),
+            .had_stream_error = false,
+        };
+    }
 
     var cfg = std.mem.zeroes(c.struct_fy_parse_cfg);
     cfg.flags = @as(@TypeOf(cfg.flags), c.FYPCF_QUIET);
@@ -113,22 +97,15 @@ pub fn parseTestsuiteEventsDetailedAlloc(allocator: std.mem.Allocator, source: [
     };
 }
 
-// C binding types (real on non-Windows, stubs on Windows)
-const fy_list_head_type = if (builtin.os.tag == .windows)
-    opaque {}
-else
-    extern struct {
-        next: ?*@This(),
-        prev: ?*@This(),
-    };
+const fy_list_head_type = extern struct {
+    next: ?*@This(),
+    prev: ?*@This(),
+};
 
-const fy_eventp_type = if (builtin.os.tag == .windows)
-    opaque {}
-else
-    extern struct {
-        node: fy_list_head_type,
-        e: c.struct_fy_event,
-    };
+const fy_eventp_type = extern struct {
+    node: fy_list_head_type,
+    e: c.struct_fy_event,
+};
 
 // C extern declarations
 extern "c" fn fy_parse_private(fyp: *c.struct_fy_parser) ?*fy_eventp_type;

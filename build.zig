@@ -167,16 +167,14 @@ pub fn build(b: *std.Build) void {
         },
     );
 
-    if (target.result.os.tag != .windows) {
-        fy_mod.addIncludePath(b.path("modules/libfyaml/include"));
-        fy_mod.addIncludePath(b.path("modules/libfyaml/src/lib"));
-        fy_mod.addIncludePath(b.path("modules/libfyaml/src/util"));
-        fy_mod.addIncludePath(b.path("modules/libfyaml/src/xxhash"));
-        fy_mod.addIncludePath(b.path("modules/libfyaml/src/thread"));
-        fy_mod.addIncludePath(b.path("modules/libfyaml/src/allocator"));
-        fy_mod.addIncludePath(b.path("modules/libfyaml/src/blake3"));
-        fy_mod.addIncludePath(b.path("src/lib/fy_config"));
-    }
+    fy_mod.addIncludePath(b.path("modules/libfyaml/include"));
+    fy_mod.addIncludePath(b.path("modules/libfyaml/src/lib"));
+    fy_mod.addIncludePath(b.path("modules/libfyaml/src/util"));
+    fy_mod.addIncludePath(b.path("modules/libfyaml/src/xxhash"));
+    fy_mod.addIncludePath(b.path("modules/libfyaml/src/thread"));
+    fy_mod.addIncludePath(b.path("modules/libfyaml/src/allocator"));
+    fy_mod.addIncludePath(b.path("modules/libfyaml/src/blake3"));
+    fy_mod.addIncludePath(b.path("src/lib/fy_config"));
 
     const docs_step = b.step("docs", "Generate the documentation");
 

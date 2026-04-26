@@ -1,6 +1,5 @@
 const std = @import("std");
 const testing = std.testing;
-const builtin = @import("builtin");
 const build_options = @import("build_options");
 
 const fy = @import("fy");
@@ -32,7 +31,6 @@ test "yaml-test-suite coverage across all fixture cases" {
 }
 
 test "yaml-test-suite coverage across all fixture cases via fy" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     try runSpecCoverage(.fy);
 }
 

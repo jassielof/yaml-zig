@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [ main ]
   pull_request:
-    branches: [main]
+    branches: [ main ]
   workflow_dispatch:
 
 permissions:
@@ -22,19 +22,19 @@ jobs:
           submodules: true
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+        uses: jassielof/setup-zig@v1
 
       - name: Formatting
-        run: zig fmt --color on .
+        run: zig fmt .
 
       - name: Build
-        run: zig build --summary all -Doptimize=ReleaseSafe
+        run: zig build --summary all
 
       - name: Docs
-        run: zig build --summary all docs
+        run: zig build docs --summary all
 
       - name: Upload artifact
-        uses: actions/upload-pages-artifact@v4
+        uses: actions/upload-pages-artifact@v5
         with:
           path: zig-out/docs
   tests:
@@ -54,7 +54,7 @@ jobs:
           submodules: true
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+        uses: jassielof/setup-zig@v1
 
       - name: Tests
         run: zig build --summary all tests -Doptimize=ReleaseSafe -Dsummary=true
@@ -76,8 +76,10 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
+    name: Deploy to GitHub Pages
+    if: github.event_name != 'pull_request'
     needs: tests
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
