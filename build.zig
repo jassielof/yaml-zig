@@ -1,4 +1,5 @@
 const std = @import("std");
+const fy = @import("fy.build.zig");
 
 pub fn build(b: *std.Build) void {
     const mod_name = "yaml";
@@ -9,144 +10,11 @@ pub fn build(b: *std.Build) void {
 
     const summary_only = b.option(bool, "summary", "Only print short coverage summary (useful for CI)") orelse false;
 
-    const fy_c_lib = b.addLibrary(.{
-        .name = "fyaml",
-        .linkage = .static,
-        .root_module = b.createModule(.{
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        }),
+    const fy_dep = fy.create(b, .{
+        .target = target,
+        .optimize = optimize,
+        .module_name = fy_mod_name,
     });
-    fy_c_lib.root_module.link_libc = true;
-    fy_c_lib.root_module.addIncludePath(b.path("modules/libfyaml/include"));
-    fy_c_lib.root_module.addIncludePath(b.path("modules/libfyaml/src/lib"));
-    fy_c_lib.root_module.addIncludePath(b.path("modules/libfyaml/src/util"));
-    fy_c_lib.root_module.addIncludePath(b.path("modules/libfyaml/src/xxhash"));
-    fy_c_lib.root_module.addIncludePath(b.path("modules/libfyaml/src/thread"));
-    fy_c_lib.root_module.addIncludePath(b.path("modules/libfyaml/src/allocator"));
-    fy_c_lib.root_module.addIncludePath(b.path("modules/libfyaml/src/blake3"));
-    fy_c_lib.root_module.addIncludePath(b.path("src/lib/fy_config"));
-
-    if (target.result.os.tag == .windows) {
-        fy_c_lib.root_module.addCSourceFiles(.{
-            .root = b.path("modules/libfyaml"),
-            .files = &.{
-                "src/lib/fy-accel.c",
-                "src/lib/fy-atom.c",
-                "src/lib/fy-composer.c",
-                "src/lib/fy-diag.c",
-                "src/lib/fy-doc.c",
-                "src/lib/fy-docbuilder.c",
-                "src/lib/fy-docstate.c",
-                "src/lib/fy-dump.c",
-                "src/lib/fy-emit.c",
-                "src/lib/fy-event.c",
-                "src/lib/fy-input.c",
-                "src/lib/fy-parse.c",
-                "src/lib/fy-path.c",
-                "src/lib/fy-token.c",
-                "src/lib/fy-types.c",
-                "src/lib/fy-walk.c",
-                "src/util/fy-blob.c",
-                "src/util/fy-ctype.c",
-                "src/util/fy-utf8.c",
-                "src/util/fy-utils.c",
-                "src/xxhash/xxhash.c",
-                "src/thread/fy-thread.c",
-                "src/allocator/fy-allocator.c",
-                "src/allocator/fy-allocator-linear.c",
-                "src/allocator/fy-allocator-malloc.c",
-                "src/allocator/fy-allocator-mremap.c",
-                "src/allocator/fy-allocator-dedup.c",
-                "src/allocator/fy-allocator-auto.c",
-                "src/blake3/blake3_host_state.c",
-                "src/blake3/blake3_backend.c",
-                "src/blake3/blake3_be_cpusimd.c",
-                "src/blake3/fy-blake3.c",
-                "src/lib/fy-composer-diag.c",
-                "src/lib/fy-doc-diag.c",
-                "src/lib/fy-docbuilder-diag.c",
-                "src/lib/fy-input-diag.c",
-                "src/lib/fy-parse-diag.c",
-            },
-            .flags = &.{ "-std=c11", "-DWIN32_LEAN_AND_MEAN", "-D_CRT_SECURE_NO_WARNINGS" },
-        });
-        fy_c_lib.root_module.addCSourceFiles(.{
-            .root = b.path("."),
-            .files = &.{"src/lib/fy_diag_shim.c"},
-            .flags = &.{ "-std=c11", "-DWIN32_LEAN_AND_MEAN", "-D_CRT_SECURE_NO_WARNINGS" },
-        });
-        fy_c_lib.root_module.addCSourceFiles(.{
-            .root = b.path("modules/libfyaml"),
-            .files = &.{
-                "src/blake3/blake3_portable.c",
-                "src/blake3/blake3.c",
-            },
-            .flags = &.{ "-std=c11", "-DWIN32_LEAN_AND_MEAN", "-D_CRT_SECURE_NO_WARNINGS", "-DHASHER_SUFFIX=portable", "-DSIMD_DEGREE=1" },
-        });
-    } else {
-        fy_c_lib.root_module.addCSourceFiles(.{
-            .root = b.path("modules/libfyaml"),
-            .files = &.{
-                "src/lib/fy-accel.c",
-                "src/lib/fy-atom.c",
-                "src/lib/fy-composer.c",
-                "src/lib/fy-diag.c",
-                "src/lib/fy-doc.c",
-                "src/lib/fy-docbuilder.c",
-                "src/lib/fy-docstate.c",
-                "src/lib/fy-dump.c",
-                "src/lib/fy-emit.c",
-                "src/lib/fy-event.c",
-                "src/lib/fy-input.c",
-                "src/lib/fy-parse.c",
-                "src/lib/fy-path.c",
-                "src/lib/fy-token.c",
-                "src/lib/fy-types.c",
-                "src/lib/fy-walk.c",
-                "src/util/fy-blob.c",
-                "src/util/fy-ctype.c",
-                "src/util/fy-utf8.c",
-                "src/util/fy-utils.c",
-                "src/xxhash/xxhash.c",
-                "src/thread/fy-thread.c",
-                "src/allocator/fy-allocator.c",
-                "src/allocator/fy-allocator-linear.c",
-                "src/allocator/fy-allocator-malloc.c",
-                "src/allocator/fy-allocator-mremap.c",
-                "src/allocator/fy-allocator-dedup.c",
-                "src/allocator/fy-allocator-auto.c",
-                "src/blake3/blake3_host_state.c",
-                "src/blake3/blake3_backend.c",
-                "src/blake3/blake3_be_cpusimd.c",
-                "src/blake3/fy-blake3.c",
-                "src/lib/fy-composer-diag.c",
-                "src/lib/fy-doc-diag.c",
-                "src/lib/fy-docbuilder-diag.c",
-                "src/lib/fy-input-diag.c",
-                "src/lib/fy-parse-diag.c",
-            },
-            .flags = &.{ "-std=c11", "-D_GNU_SOURCE" },
-        });
-        fy_c_lib.root_module.addCSourceFiles(.{
-            .root = b.path("."),
-            .files = &.{"src/lib/fy_diag_shim.c"},
-            .flags = &.{ "-std=c11", "-D_GNU_SOURCE" },
-        });
-        fy_c_lib.root_module.addCSourceFiles(.{
-            .root = b.path("modules/libfyaml"),
-            .files = &.{
-                "src/blake3/blake3_portable.c",
-                "src/blake3/blake3.c",
-            },
-            .flags = &.{ "-std=c11", "-D_GNU_SOURCE", "-DHASHER_SUFFIX=portable", "-DSIMD_DEGREE=1" },
-        });
-    }
-
-    if (target.result.os.tag != .windows) {
-        fy_c_lib.root_module.linkSystemLibrary("pthread", .{});
-    }
 
     const lib_mod = b.addModule(
         mod_name,
@@ -154,36 +22,6 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/lib/yaml.zig"),
             .target = target,
             .optimize = optimize,
-        },
-    );
-
-    const fy_translate_c = b.addTranslateC(.{
-        .root_source_file = b.path("src/lib/fy_c.h"),
-        .target = target,
-        .optimize = optimize,
-    });
-    fy_translate_c.addIncludePath(b.path("modules/libfyaml/include"));
-    fy_translate_c.addIncludePath(b.path("modules/libfyaml/src/lib"));
-    fy_translate_c.addIncludePath(b.path("modules/libfyaml/src/util"));
-    fy_translate_c.addIncludePath(b.path("modules/libfyaml/src/xxhash"));
-    fy_translate_c.addIncludePath(b.path("modules/libfyaml/src/thread"));
-    fy_translate_c.addIncludePath(b.path("modules/libfyaml/src/allocator"));
-    fy_translate_c.addIncludePath(b.path("modules/libfyaml/src/blake3"));
-    fy_translate_c.addIncludePath(b.path("src/lib/fy_config"));
-
-    const fy_mod = b.addModule(
-        fy_mod_name,
-        .{
-            .root_source_file = b.path("src/lib/fy.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-            .imports = &.{
-                .{
-                    .name = "fy_c",
-                    .module = fy_translate_c.createModule(),
-                },
-            },
         },
     );
 
@@ -201,16 +39,14 @@ pub fn build(b: *std.Build) void {
                 .imports = &.{
                     .{
                         .name = fy_mod_name,
-                        .module = fy_mod,
+                        .module = fy_dep.module,
                     },
                 },
             },
         ),
     });
 
-    docs_lib.root_module.linkLibrary(fy_c_lib);
-    docs_lib.root_module.addIncludePath(b.path("modules/libfyaml/include"));
-    docs_lib.root_module.addIncludePath(b.path("src/lib/fy_config"));
+    fy_dep.link(docs_lib.root_module);
 
     const docs = b.addInstallDirectory(.{
         .source_dir = docs_lib.getEmittedDocs(),
@@ -233,14 +69,12 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
             .imports = &.{
                 .{ .name = mod_name, .module = lib_mod },
-                .{ .name = fy_mod_name, .module = fy_mod },
+                .{ .name = fy_mod_name, .module = fy_dep.module },
                 .{ .name = "build_options", .module = build_options.createModule() },
             },
         }),
     });
-    integration_tests.root_module.linkLibrary(fy_c_lib);
-    integration_tests.root_module.addIncludePath(b.path("modules/libfyaml/include"));
-    integration_tests.root_module.addIncludePath(b.path("src/lib/fy_config"));
+    fy_dep.link(integration_tests.root_module);
 
     const run_integration_tests = b.addRunArtifact(integration_tests);
     tests_step.dependOn(&run_integration_tests.step);

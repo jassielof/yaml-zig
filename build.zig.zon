@@ -11,6 +11,7 @@
     },
     .paths = .{
         "build.zig",
+        "fy.build.zig",
         "build.zig.zon",
         "src",
         "LICENSE.txt",
