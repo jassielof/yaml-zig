@@ -84,7 +84,7 @@ pub fn create(b: *std.Build, options: Options) Dependency {
         }),
     });
     c_lib.root_module.link_libc = true;
-    addIncludePaths(c_lib.root_module);
+    addIncludePaths(c_lib.root_module, options.target);
     addCSourceFiles(b, c_lib, options.target);
 
     if (options.target.result.os.tag != .windows) {
@@ -96,7 +96,7 @@ pub fn create(b: *std.Build, options: Options) Dependency {
         .target = options.target,
         .optimize = options.optimize,
     });
-    addTranslateIncludePaths(translate_c);
+    addTranslateIncludePaths(translate_c, options.target);
 
     const module = b.addModule(
         options.module_name,
@@ -120,25 +120,31 @@ pub fn create(b: *std.Build, options: Options) Dependency {
     };
 }
 
-fn addIncludePaths(module: *std.Build.Module) void {
+fn addIncludePaths(module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
     const b = module.owner;
     inline for (include_paths) |path| {
         module.addIncludePath(b.path(path));
     }
+    if (target.result.os.tag == .windows) {
+        module.addIncludePath(b.path("src/lib/fy_windows"));
+    }
 }
 
-fn addTranslateIncludePaths(translate_c: *std.Build.Step.TranslateC) void {
+fn addTranslateIncludePaths(translate_c: *std.Build.Step.TranslateC, target: std.Build.ResolvedTarget) void {
     const b = translate_c.step.owner;
     inline for (include_paths) |path| {
         translate_c.addIncludePath(b.path(path));
+    }
+    if (target.result.os.tag == .windows) {
+        translate_c.addIncludePath(b.path("src/lib/fy_windows"));
     }
 }
 
 fn addCSourceFiles(b: *std.Build, c_lib: *std.Build.Step.Compile, target: std.Build.ResolvedTarget) void {
     const common_flags: []const []const u8 = if (target.result.os.tag == .windows)
-        &.{ "-std=c11", "-DWIN32_LEAN_AND_MEAN", "-D_CRT_SECURE_NO_WARNINGS" }
+        &.{ "-std=c11", "-DHAVE_CONFIG_H", "-DWIN32_LEAN_AND_MEAN", "-D_CRT_SECURE_NO_WARNINGS" }
     else
-        &.{ "-std=c11", "-D_GNU_SOURCE" };
+        &.{ "-std=c11", "-DHAVE_CONFIG_H", "-D_GNU_SOURCE" };
 
     c_lib.root_module.addCSourceFiles(.{
         .root = b.path("modules/libfyaml"),
@@ -152,9 +158,9 @@ fn addCSourceFiles(b: *std.Build, c_lib: *std.Build.Step.Compile, target: std.Bu
     });
 
     const blake3_flags: []const []const u8 = if (target.result.os.tag == .windows)
-        &.{ "-std=c11", "-DWIN32_LEAN_AND_MEAN", "-D_CRT_SECURE_NO_WARNINGS", "-DHASHER_SUFFIX=portable", "-DSIMD_DEGREE=1" }
+        &.{ "-std=c11", "-DHAVE_CONFIG_H", "-DWIN32_LEAN_AND_MEAN", "-D_CRT_SECURE_NO_WARNINGS", "-DHASHER_SUFFIX=portable", "-DSIMD_DEGREE=1" }
     else
-        &.{ "-std=c11", "-D_GNU_SOURCE", "-DHASHER_SUFFIX=portable", "-DSIMD_DEGREE=1" };
+        &.{ "-std=c11", "-DHAVE_CONFIG_H", "-D_GNU_SOURCE", "-DHASHER_SUFFIX=portable", "-DSIMD_DEGREE=1" };
 
     c_lib.root_module.addCSourceFiles(.{
         .root = b.path("modules/libfyaml"),

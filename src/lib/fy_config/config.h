@@ -3,8 +3,8 @@
 
 /* Windows compatibility for sys/uio.h */
 #ifdef _WIN32
-#ifndef _SYS_UIO_H_
-#define _SYS_UIO_H_
+#ifndef _FY_IOVEC_DEFINED
+#define _FY_IOVEC_DEFINED
 #include <stddef.h>
 struct iovec {
   void *iov_base;
