@@ -1,4 +1,5 @@
 const std = @import("std");
+
 const fy = @import("fy.build.zig");
 
 pub fn build(b: *std.Build) void {
@@ -11,9 +12,9 @@ pub fn build(b: *std.Build) void {
     const summary_only = b.option(bool, "summary", "Only print short coverage summary (useful for CI)") orelse false;
 
     const fy_dep = fy.create(b, .{
+        .module_name = fy_mod_name,
         .target = target,
         .optimize = optimize,
-        .module_name = fy_mod_name,
     });
 
     const lib_mod = b.addModule(
@@ -74,6 +75,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+
     fy_dep.link(integration_tests.root_module);
 
     const run_integration_tests = b.addRunArtifact(integration_tests);
@@ -82,6 +84,7 @@ pub fn build(b: *std.Build) void {
     // const unit_tests = b.addTest(.{
     //     .root_module = lib_mod,
     // });
+
     // const run_unit_tests = b.addRunArtifact(unit_tests);
     // tests_step.dependOn(&run_unit_tests.step);
 }

@@ -1,4 +1,5 @@
-//! YAML for Zig.
+//! YAML.
+
+pub const fy = @import("fy");
 
 pub const yaml = @import("yaml.zig");
-pub const fy = @import("fy");
