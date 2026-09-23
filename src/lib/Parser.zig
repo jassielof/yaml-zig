@@ -1463,6 +1463,7 @@ fn collectMultilineQuotedScalar(self: *Parser, base_indent: usize, style: Token.
         self.index += 1;
     }
 
+    if (!hasClosingQuote(out.items, quote)) return Error.Parse.UnterminatedString;
     return out.toOwnedSlice(self.allocator);
 }
 
@@ -1507,6 +1508,7 @@ fn collectMultilineQuotedValue(self: *Parser, base_indent: usize, initial: []con
         self.index += 1;
     }
 
+    if (!hasClosingQuote(out.items, quote)) return Error.Parse.UnterminatedString;
     return out.toOwnedSlice(self.allocator);
 }
 
