@@ -1166,7 +1166,28 @@ fn parseFlowValue(self: *Parser, tokens: []const Token.Token, cursor: *usize) an
                 .data = .{ .sequence_start = .{ .style = .flow } },
             });
             while (cursor.* < tokens.len and tokens[cursor.*].kind != .rbracket and tokens[cursor.*].kind != .eof) {
-                try self.parseFlowValue(tokens, cursor);
+                // `key: value` inside a flow sequence is a single-entry mapping.
+                const entry_at = self.events.items.len;
+                if (tokens[cursor.*].kind == .colon) {
+                    if (tokens[cursor.*].indent != 0) return Error.Parse.UnexpectedToken;
+                    try self.pushScalar("null", .plain, null, tokens[cursor.*].span);
+                } else {
+                    try self.parseFlowValue(tokens, cursor);
+                }
+                if (cursor.* < tokens.len and tokens[cursor.*].kind == .colon) {
+                    if (tokens[cursor.*].indent != 0) return Error.Parse.UnexpectedToken;
+                    try self.events.insert(self.allocator, entry_at, .{
+                        .kind = .mapping_start,
+                        .data = .{ .mapping_start = .{ .style = .flow } },
+                    });
+                    cursor.* += 1;
+                    if (cursor.* >= tokens.len or tokens[cursor.*].kind == .comma or tokens[cursor.*].kind == .rbracket or tokens[cursor.*].kind == .eof) {
+                        try self.pushScalar("null", .plain, null, tok.span);
+                    } else {
+                        try self.parseFlowValue(tokens, cursor);
+                    }
+                    try self.pushSimple(.mapping_end, tok.span);
+                }
                 if (cursor.* < tokens.len and tokens[cursor.*].kind == .comma) cursor.* += 1;
             }
             if (cursor.* >= tokens.len or tokens[cursor.*].kind != .rbracket) return Error.Parse.UnterminatedFlowCollection;

@@ -311,17 +311,46 @@ pub fn tokenizeFlow(
                     continue;
                 }
                 json_key_ready = false;
-                try out.append(allocator, .{ .kind = .colon, .span = makeSpan(line_no, start_col, start_col + 1) });
+                try out.append(allocator, .{
+                    .kind = .colon,
+                    .span = makeSpan(line_no, start_col, start_col + 1),
+                    // A break between a flow-sequence key and ':' is invalid.
+                    .indent = if (colonFollowsBreak(text, i)) 1 else 0,
+                });
             },
-            '*', '&' => {
+            '*' => {
                 json_key_ready = false;
-                const marker = c;
                 i += 1;
                 const name_start = i;
                 while (i < text.len and isFlowNameChar(text[i])) : (i += 1) {}
                 const lexeme = text[name_start..i];
                 try out.append(allocator, .{
-                    .kind = if (marker == '*') .alias else .scalar,
+                    .kind = .alias,
+                    .lexeme = lexeme,
+                    .span = makeSpan(line_no, start_col, column_base + i),
+                    .scalar_style = .plain,
+                });
+                continue;
+            },
+            '&' => {
+                // Anchors do not change the JSON value. Skip the name and parse the node.
+                json_key_ready = false;
+                i += 1;
+                while (i < text.len and isFlowNameChar(text[i])) : (i += 1) {}
+                continue;
+            },
+            '?' => {
+                if (i + 1 < text.len and (text[i + 1] == ' ' or text[i + 1] == '\t' or text[i + 1] == '\n' or text[i + 1] == '\r')) {
+                    i += 1;
+                    continue;
+                }
+                const start = i;
+                i = nextPlainEnd(text, start);
+                const lexeme = try plainFlowLexeme(allocator, text[start..i], folded);
+                if (lexeme.len == 0) continue;
+                json_key_ready = false;
+                try out.append(allocator, .{
+                    .kind = .scalar,
                     .lexeme = lexeme,
                     .span = makeSpan(line_no, start_col, column_base + i),
                     .scalar_style = .plain,
@@ -341,7 +370,19 @@ pub fn tokenizeFlow(
             '!' => {
                 json_key_ready = false;
                 i += 1;
-                while (i < text.len and text[i] != ' ' and text[i] != '\t' and text[i] != '\n' and !isFlowDelimiter(text[i])) : (i += 1) {}
+                while (i < text.len and text[i] != ' ' and text[i] != '\t' and text[i] != '\n' and text[i] != '\r' and text[i] != ':' and !isFlowDelimiter(text[i])) : (i += 1) {}
+                var look = i;
+                while (look < text.len and (text[look] == ' ' or text[look] == '\t' or text[look] == '\n' or text[look] == '\r')) : (look += 1) {}
+                const bare = look >= text.len or text[look] == ',' or text[look] == ':' or text[look] == ']' or text[look] == '}' or text[look] == '#';
+                if (bare) {
+                    try out.append(allocator, .{
+                        .kind = .scalar,
+                        .lexeme = "",
+                        .span = makeSpan(line_no, start_col, column_base + i),
+                        .scalar_style = .double_quoted,
+                    });
+                    json_key_ready = true;
+                }
                 continue;
             },
             '\'', '"' => {
@@ -791,6 +832,16 @@ fn foldFlowQuoted(allocator: std.mem.Allocator, inner: []const u8, folded: *std.
 
 fn isFlowDelimiter(c: u8) bool {
     return c == '[' or c == ']' or c == '{' or c == '}' or c == ',';
+}
+
+fn colonFollowsBreak(text: []const u8, idx: usize) bool {
+    var k = idx;
+    while (k > 0) {
+        k -= 1;
+        if (text[k] == '\n' or text[k] == '\r') return true;
+        if (text[k] != ' ' and text[k] != '\t') return false;
+    }
+    return false;
 }
 
 fn nextPlainEnd(text: []const u8, start: usize) usize {
