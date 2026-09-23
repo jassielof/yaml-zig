@@ -285,6 +285,14 @@ fn parseBlockSequence(self: *Parser, indent: usize) anyerror!void {
             continue;
         }
 
+        // `- ? : x` / `- ? earth: blue` is an explicit-key mapping, not a scalar.
+        if (line.style == .plain and trimmed_val.len >= 1 and trimmed_val[0] == '?' and
+            (trimmed_val.len == 1 or trimmed_val[1] == ' ' or trimmed_val[1] == '\t'))
+        {
+            try self.parseCompactExplicit(line, indent);
+            continue;
+        }
+
         // Check for inline mapping colon in the value
         if (line.style == .plain and line.value.len > 0 and line.value[0] != '[' and line.value[0] != '{') {
             const stripped_val = stripTagPrefix(std.mem.trim(u8, line.value, " "));
@@ -327,6 +335,96 @@ fn parseBlockSequence(self: *Parser, indent: usize) anyerror!void {
     }
 
     try self.pushSimple(.sequence_end, .{});
+}
+
+fn parseCompactExplicit(self: *Parser, line: Scanner.ScannedLine, seq_indent: usize) anyerror!void {
+    const raw = std.mem.trim(u8, line.value, " \t");
+    const rest = std.mem.trim(u8, if (raw.len <= 1) "" else raw[1..], " \t");
+    try self.events.append(self.allocator, .{
+        .kind = .mapping_start,
+        .data = .{ .mapping_start = .{ .style = .block } },
+    });
+    try self.parseExplicitKeyNode(rest, line, seq_indent);
+    try self.parseExplicitValueLine(seq_indent, line.span);
+    try self.pushSimple(.mapping_end, .{});
+}
+
+fn parseExplicitKeyNode(self: *Parser, rest: []const u8, line: Scanner.ScannedLine, seq_indent: usize) anyerror!void {
+    if (rest.len == 0) {
+        self.index += 1;
+        if (self.index < self.scanned.lines.items.len and self.scanned.lines.items[self.index].indent > seq_indent) {
+            try self.parseBlockValue(self.scanned.lines.items[self.index].indent, false);
+        } else {
+            try self.pushScalar("", .plain, null, line.span);
+        }
+        return;
+    }
+
+    self.index += 1;
+    if (rest[0] == ':' and (rest.len == 1 or rest[1] == ' ' or rest[1] == '\t')) {
+        const inner = if (rest.len <= 1) "" else std.mem.trimStart(u8, rest[2..], " \t");
+        try self.events.append(self.allocator, .{
+            .kind = .mapping_start,
+            .data = .{ .mapping_start = .{ .style = .block } },
+        });
+        try self.pushScalar("", .plain, null, line.span);
+        if (inner.len == 0) {
+            try self.pushScalar("", .plain, null, line.span);
+        } else if (Scanner.findInlineMappingColon(inner) != null) {
+            try self.emitInlineMappingValue(inner, seq_indent + 2, line.line_no);
+        } else {
+            try self.parseScalarLikeValue(inner, detectInlineStyle(inner), line.line_no, seq_indent + 2);
+        }
+        try self.pushSimple(.mapping_end, .{});
+        return;
+    }
+    if (isCompactSequence(rest)) {
+        try self.emitCompactSequence(seq_indent + 2, rest, line.span, line.line_no);
+        return;
+    }
+    if (Scanner.findInlineMappingColon(rest) != null and (rest[0] != '[' and rest[0] != '{')) {
+        try self.emitInlineMappingValue(rest, seq_indent + 2, line.line_no);
+        return;
+    }
+    try self.parseScalarLikeValue(rest, detectInlineStyle(rest), line.line_no, seq_indent + 2);
+}
+
+fn parseExplicitValueLine(self: *Parser, seq_indent: usize, span: @import("Span.zig")) anyerror!void {
+    const col = seq_indent + 2;
+    if (self.index >= self.scanned.lines.items.len) {
+        try self.pushScalar("", .plain, null, span);
+        return;
+    }
+    const next = self.scanned.lines.items[self.index];
+    const value_line = next.indent == col and (next.kind == .explicit_value or
+        (next.kind == .mapping_entry and next.key.len == 0 and !next.explicit_key));
+    if (!value_line) {
+        try self.pushScalar("", .plain, null, span);
+        return;
+    }
+    const text = std.mem.trim(u8, next.value, " \t");
+    self.index += 1;
+    if (text.len == 0) {
+        if (self.index < self.scanned.lines.items.len and self.scanned.lines.items[self.index].indent > col) {
+            try self.parseBlockValue(self.scanned.lines.items[self.index].indent, false);
+        } else {
+            try self.pushScalar("", .plain, null, next.span);
+        }
+        return;
+    }
+    if (isCompactSequence(text)) {
+        try self.emitCompactSequence(col, text, next.span, next.line_no);
+        return;
+    }
+    if ((text[0] == '[' or text[0] == '{') or Scanner.findInlineMappingColon(text) != null) {
+        if (text[0] == '[' or text[0] == '{') {
+            try self.parseFlow(text, next.line_no, col);
+        } else {
+            try self.emitInlineMappingValue(text, col, next.line_no);
+        }
+        return;
+    }
+    try self.parseScalarLikeValue(text, next.style, next.line_no, col);
 }
 
 fn emitSequenceItemMapping(self: *Parser, line: Scanner.ScannedLine, seq_indent: usize) anyerror!void {
@@ -1157,7 +1255,7 @@ fn parseScalarLikeValue(
             if (key.len > 0) {
                 try self.events.append(self.allocator, .{
                     .kind = .mapping_start,
-                    .data = .{ .mapping_start = .{ .style = .flow } },
+                    .data = .{ .mapping_start = .{ .style = .block } },
                 });
                 try self.pushScalar(key, .plain, null, .{});
                 try self.parseScalarLikeValue(raw_val, detectInlineStyle(raw_val), line_no, col + idx + 1);
@@ -1192,8 +1290,39 @@ fn parseFlow(self: *Parser, text: []const u8, line_no: usize, col: usize) anyerr
     const tokens = try Scanner.tokenizeFlow(self.allocator, text, line_no, col, &folded);
     defer self.allocator.free(tokens);
     var cursor: usize = 0;
+    const at = self.events.items.len;
     try self.parseFlowValue(tokens, &cursor);
+    // `[]: x` in block context is a mapping whose key is the flow node.
+    if (cursor < tokens.len and tokens[cursor].kind == .colon) {
+        if (tokens[cursor].indent != 0) return Error.Parse.UnexpectedToken;
+        try self.events.insert(self.allocator, at, .{
+            .kind = .mapping_start,
+            .data = .{ .mapping_start = .{ .style = .block } },
+        });
+        cursor += 1;
+        try self.parseFlowPairValue(tokens, &cursor, tokens[cursor - 1].span);
+        try self.pushSimple(.mapping_end, .{});
+    }
     if (cursor < tokens.len and tokens[cursor].kind != .eof) return Error.Parse.UnexpectedToken;
+}
+
+fn parseFlowPairValue(self: *Parser, tokens: []const Token.Token, cursor: *usize, span: @import("Span.zig")) anyerror!void {
+    if (cursor.* >= tokens.len or tokens[cursor.*].kind == .comma or tokens[cursor.*].kind == .rbrace or tokens[cursor.*].kind == .rbracket or tokens[cursor.*].kind == .eof) {
+        try self.pushScalar("", .plain, null, span);
+    } else {
+        try self.parseFlowValue(tokens, cursor);
+    }
+}
+
+fn noteFlowAnchor(self: *Parser, anchor: []const u8) !void {
+    if (anchor.len == 0) return;
+    const ev = &self.events.items[self.events.items.len - 1];
+    const name = try self.allocator.dupe(u8, anchor);
+    switch (ev.kind) {
+        .sequence_start => ev.data.sequence_start.anchor = name,
+        .mapping_start => ev.data.mapping_start.anchor = name,
+        else => self.allocator.free(name),
+    }
 }
 
 fn parseFlowValue(self: *Parser, tokens: []const Token.Token, cursor: *usize) anyerror!void {
@@ -1206,6 +1335,7 @@ fn parseFlowValue(self: *Parser, tokens: []const Token.Token, cursor: *usize) an
                 .kind = .sequence_start,
                 .data = .{ .sequence_start = .{ .style = .flow } },
             });
+            try self.noteFlowAnchor(tok.anchor);
             while (cursor.* < tokens.len and tokens[cursor.*].kind != .rbracket and tokens[cursor.*].kind != .eof) {
                 // `key: value` inside a flow sequence is a single-entry mapping.
                 const entry_at = self.events.items.len;
@@ -1241,26 +1371,53 @@ fn parseFlowValue(self: *Parser, tokens: []const Token.Token, cursor: *usize) an
                 .kind = .mapping_start,
                 .data = .{ .mapping_start = .{ .style = .flow } },
             });
+            try self.noteFlowAnchor(tok.anchor);
             while (cursor.* < tokens.len and tokens[cursor.*].kind != .rbrace and tokens[cursor.*].kind != .eof) {
                 const key = tokens[cursor.*];
-                if (key.kind != .scalar) return Error.Parse.UnexpectedToken;
-                const norm_key = try normalizeScalar(self.allocator, key.lexeme, key.scalar_style);
-                defer self.allocator.free(norm_key);
-                const flow_anchor: ?[]const u8 = if (key.anchor.len > 0) key.anchor else null;
-                try self.pushScalar(norm_key, key.scalar_style, flow_anchor, key.span);
-                cursor.* += 1;
-                if (cursor.* >= tokens.len) return Error.Parse.UnexpectedToken;
-                if (tokens[cursor.*].kind == .colon) {
-                    cursor.* += 1;
-                    if (cursor.* >= tokens.len or tokens[cursor.*].kind == .comma or tokens[cursor.*].kind == .rbrace or tokens[cursor.*].kind == .rbracket or tokens[cursor.*].kind == .eof) {
-                        try self.pushScalar("", .plain, null, key.span);
-                    } else {
-                        try self.parseFlowValue(tokens, cursor);
-                    }
-                } else {
+                if (key.kind == .colon) {
                     try self.pushScalar("", .plain, null, key.span);
+                    cursor.* += 1;
+                    try self.parseFlowPairValue(tokens, cursor, key.span);
+                } else if (key.kind == .alias) {
+                    try self.events.append(self.allocator, .{
+                        .kind = .alias,
+                        .data = .{ .alias = .{ .name = try self.allocator.dupe(u8, key.lexeme), .span = key.span } },
+                    });
+                    cursor.* += 1;
+                    if (cursor.* < tokens.len and tokens[cursor.*].kind == .colon) {
+                        cursor.* += 1;
+                        try self.parseFlowPairValue(tokens, cursor, key.span);
+                    } else {
+                        try self.pushScalar("", .plain, null, key.span);
+                    }
+                } else if (key.kind == .lbracket or key.kind == .lbrace) {
+                    try self.parseFlowValue(tokens, cursor);
+                    if (cursor.* < tokens.len and tokens[cursor.*].kind == .colon) {
+                        cursor.* += 1;
+                        try self.parseFlowPairValue(tokens, cursor, key.span);
+                    } else {
+                        try self.pushScalar("", .plain, null, key.span);
+                    }
+                } else if (key.kind == .scalar) {
+                    const norm_key = try normalizeScalar(self.allocator, key.lexeme, key.scalar_style);
+                    defer self.allocator.free(norm_key);
+                    const flow_anchor: ?[]const u8 = if (key.anchor.len > 0) key.anchor else null;
+                    try self.pushScalar(norm_key, key.scalar_style, flow_anchor, key.span);
+                    cursor.* += 1;
+                    if (cursor.* >= tokens.len) return Error.Parse.UnexpectedToken;
+                    if (tokens[cursor.*].kind == .colon) {
+                        cursor.* += 1;
+                        try self.parseFlowPairValue(tokens, cursor, key.span);
+                    } else {
+                        try self.pushScalar("", .plain, null, key.span);
+                    }
+                } else return Error.Parse.UnexpectedToken;
+                // Flow mapping entries are separated by commas. A newline is not enough.
+                if (cursor.* < tokens.len and tokens[cursor.*].kind == .comma) {
+                    cursor.* += 1;
+                } else if (cursor.* < tokens.len and tokens[cursor.*].kind != .rbrace and tokens[cursor.*].kind != .eof) {
+                    return Error.Parse.UnexpectedToken;
                 }
-                if (cursor.* < tokens.len and tokens[cursor.*].kind == .comma) cursor.* += 1;
             }
             if (cursor.* >= tokens.len or tokens[cursor.*].kind != .rbrace) return Error.Parse.UnterminatedFlowCollection;
             cursor.* += 1;
@@ -1514,6 +1671,7 @@ fn collectMultilineQuotedScalar(self: *Parser, base_indent: usize, style: Token.
         }
         prev_line_no = line.line_no;
         self.index += 1;
+        if (truncateAtClosingQuote(&out, quote)) break;
     }
 
     if (!hasClosingQuote(out.items, quote)) return Error.Parse.UnterminatedString;
@@ -1562,10 +1720,42 @@ fn collectMultilineQuotedValue(self: *Parser, base_indent: usize, initial: []con
         }
         prev_line_no = line.line_no;
         self.index += 1;
+        if (truncateAtClosingQuote(&out, quote)) break;
     }
 
     if (!hasClosingQuote(out.items, quote)) return Error.Parse.UnterminatedString;
     return out.toOwnedSlice(self.allocator);
+}
+
+/// A quoted scalar may close before a trailing comment (`quotes" # lala`).
+fn truncateAtClosingQuote(out: *std.ArrayListUnmanaged(u8), quote: u8) bool {
+    const end = closingQuoteIndex(out.items, quote) orelse return false;
+    if (end + 1 < out.items.len) out.shrinkRetainingCapacity(end + 1);
+    return true;
+}
+
+fn closingQuoteIndex(text: []const u8, quote: u8) ?usize {
+    if (text.len == 0 or text[0] != quote) return null;
+    var i: usize = 1;
+    if (quote == '\'') {
+        while (i < text.len) : (i += 1) {
+            if (text[i] != '\'') continue;
+            if (i + 1 < text.len and text[i + 1] == '\'') {
+                i += 1;
+                continue;
+            }
+            return i;
+        }
+        return null;
+    }
+    while (i < text.len) : (i += 1) {
+        if (text[i] == '\\' and i + 1 < text.len) {
+            i += 1;
+            continue;
+        }
+        if (text[i] == '"') return i;
+    }
+    return null;
 }
 
 /// 9MQT/01: In double-quoted, "... x" -> "...x" (strip space after "..." at line start)

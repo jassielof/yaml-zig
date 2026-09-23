@@ -204,7 +204,13 @@ pub fn scan(self: *Scanner) !ScannedDocument {
                 ""
             else
                 std.mem.trim(u8, content[2..], " \t");
-            const real_key = if (key.len > 0) stripInlineComment(key) else key;
+            const commented = if (key.len > 0) stripInlineComment(key) else key;
+            const key_head = std.mem.trimStart(u8, commented, " \t");
+            const opens_flow = key_head.len > 0 and (key_head[0] == '[' or key_head[0] == '{');
+            const real_key = if (opens_flow)
+                try joinUnclosedFlow(self.allocator, physical.items, &line_no, commented, &owned, indent, false)
+            else
+                commented;
             const key_style = if (real_key.len > 0) detectStyle(real_key) else .plain;
             try ensureBlockHeader(key_style, real_key);
             try self.lines.append(self.allocator, .{
@@ -348,18 +354,29 @@ pub fn tokenizeFlow(
         switch (c) {
             '[' => {
                 json_key_ready = false;
-                try out.append(allocator, .{ .kind = .lbracket, .span = makeSpan(line_no, start_col, start_col + 1) });
+                try out.append(allocator, .{
+                    .kind = .lbracket,
+                    .span = makeSpan(line_no, start_col, start_col + 1),
+                    .anchor = pending_anchor,
+                });
+                pending_anchor = "";
             },
             ']' => {
-                json_key_ready = false;
+                // `]` closes a JSON-like key, so `]:value` is a value colon.
+                json_key_ready = true;
                 try out.append(allocator, .{ .kind = .rbracket, .span = makeSpan(line_no, start_col, start_col + 1) });
             },
             '{' => {
                 json_key_ready = false;
-                try out.append(allocator, .{ .kind = .lbrace, .span = makeSpan(line_no, start_col, start_col + 1) });
+                try out.append(allocator, .{
+                    .kind = .lbrace,
+                    .span = makeSpan(line_no, start_col, start_col + 1),
+                    .anchor = pending_anchor,
+                });
+                pending_anchor = "";
             },
             '}' => {
-                json_key_ready = false;
+                json_key_ready = true;
                 try out.append(allocator, .{ .kind = .rbrace, .span = makeSpan(line_no, start_col, start_col + 1) });
             },
             ',' => {
