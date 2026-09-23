@@ -146,6 +146,10 @@ pub fn scan(self: *Scanner) !ScannedDocument {
 
         if (pending_directive) return Error.Parse.UnexpectedToken;
         try rejectBadTag(content);
+        // A block mapping cannot share the document-start line (`--- a: b`).
+        if (from_marker and findMappingColon(content) != null) return Error.Parse.UnexpectedToken;
+        // `&anchor - item` is not a sequence; the dash must start the line.
+        if (anchorThenBlockEntry(content)) return Error.Parse.UnexpectedToken;
 
         emitted_in_doc = true;
         open_explicit = false;
@@ -493,6 +497,25 @@ fn appendMarker(self: *Scanner, kind: LineKind, line_no: usize) !void {
         .indent = 0,
         .kind = kind,
     });
+}
+
+fn anchorThenBlockEntry(text: []const u8) bool {
+    var rest = std.mem.trimStart(u8, text, " \t");
+    if (rest.len == 0 or (rest[0] != '&' and rest[0] != '!')) return false;
+    var saw_property = false;
+    while (rest.len > 0 and (rest[0] == '&' or rest[0] == '!')) {
+        saw_property = true;
+        var i: usize = 1;
+        if (rest[0] == '!' and i < rest.len and rest[i] == '<') {
+            while (i < rest.len and rest[i] != '>') : (i += 1) {}
+            if (i < rest.len) i += 1;
+        } else {
+            while (i < rest.len and rest[i] != ' ' and rest[i] != '\t') : (i += 1) {}
+        }
+        rest = std.mem.trimStart(u8, rest[i..], " \t");
+    }
+    if (!saw_property or rest.len == 0) return false;
+    return rest[0] == '-' and (rest.len == 1 or rest[1] == ' ' or rest[1] == '\t');
 }
 
 fn rejectBadTag(text: []const u8) !void {
