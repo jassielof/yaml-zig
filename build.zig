@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const fy = @import("fy.build.zig");
+const fy = @import("build/fy.zig");
 
 pub fn build(b: *std.Build) void {
     const mod_name = "yaml";
@@ -73,4 +73,16 @@ pub fn build(b: *std.Build) void {
     });
     fy_dep.link(spec_tests.root_module);
     test_step.dependOn(&b.addRunArtifact(spec_tests).step);
+
+    const coverage_summary = b.addExecutable(.{
+        .name = "coverage-summary",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("build/coverage_summary.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_coverage_summary = b.addRunArtifact(coverage_summary);
+    const coverage_summary_step = b.step("coverage-summary", "Render YAML spec coverage into GITHUB_STEP_SUMMARY or stdout");
+    coverage_summary_step.dependOn(&run_coverage_summary.step);
 }

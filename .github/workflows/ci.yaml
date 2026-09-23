@@ -59,17 +59,11 @@ jobs:
       - name: Test
         run: zig build --summary all test -Dsummary=true
 
-      - name: Setup Python
-        if: always()
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.x"
-
       - name: Render YAML spec coverage summary
         if: always()
         env:
           MATRIX_OS: ${{ matrix.os }}
-        run: python scripts/render_coverage_summary.py
+        run: zig build coverage-summary
 
   pages:
     environment:
