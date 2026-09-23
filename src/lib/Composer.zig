@@ -88,12 +88,15 @@ fn composeNode(
     switch (ev.kind) {
         .scalar => {
             index.* += 1;
-            const resolved = try Schema.resolveScalar(
-                allocator,
-                ev.data.scalar.value,
-                ev.data.scalar.style,
-                options.resolve_core_schema,
-            );
+            const resolved = if (ev.data.scalar.tag) |tag|
+                try resolveTaggedScalar(allocator, tag, ev.data.scalar.value)
+            else
+                try Schema.resolveScalar(
+                    allocator,
+                    ev.data.scalar.value,
+                    ev.data.scalar.style,
+                    options.resolve_core_schema,
+                );
 
             if (ev.data.scalar.anchor) |anchor_name| {
                 if (skip_anchor == null or !std.mem.eql(u8, anchor_name, skip_anchor.?)) {
@@ -139,12 +142,15 @@ fn composeNode(
                 const key_ev = events[index.*];
                 const key = switch (key_ev.kind) {
                     .scalar => blk: {
-                        var resolved_key = try Schema.resolveScalar(
-                            allocator,
-                            key_ev.data.scalar.value,
-                            key_ev.data.scalar.style,
-                            options.resolve_core_schema,
-                        );
+                        var resolved_key = if (key_ev.data.scalar.tag) |tag|
+                            try resolveTaggedScalar(allocator, tag, key_ev.data.scalar.value)
+                        else
+                            try Schema.resolveScalar(
+                                allocator,
+                                key_ev.data.scalar.value,
+                                key_ev.data.scalar.style,
+                                options.resolve_core_schema,
+                            );
                         defer resolved_key.deinit(allocator);
                         if (key_ev.data.scalar.anchor) |anchor_name| {
                             try putAnchor(allocator, anchors, anchor_name, resolved_key);
@@ -198,16 +204,23 @@ fn composeNode(
     }
 }
 
-fn freeEvents(allocator: std.mem.Allocator, events: []Event) void {
+pub fn freeEvents(allocator: std.mem.Allocator, events: []Event) void {
     for (events) |ev| {
         switch (ev.kind) {
             .scalar => {
                 allocator.free(ev.data.scalar.value);
                 if (ev.data.scalar.anchor) |anchor| allocator.free(anchor);
+                if (ev.data.scalar.tag) |tag| allocator.free(tag);
             },
             .alias => allocator.free(ev.data.alias.name),
-            .sequence_start => if (ev.data.sequence_start.anchor) |a| allocator.free(a),
-            .mapping_start => if (ev.data.mapping_start.anchor) |a| allocator.free(a),
+            .sequence_start => {
+                if (ev.data.sequence_start.anchor) |a| allocator.free(a);
+                if (ev.data.sequence_start.tag) |t| allocator.free(t);
+            },
+            .mapping_start => {
+                if (ev.data.mapping_start.anchor) |a| allocator.free(a);
+                if (ev.data.mapping_start.tag) |t| allocator.free(t);
+            },
             else => {},
         }
     }
@@ -227,6 +240,18 @@ fn putAnchor(
     }
 
     try anchors.put(allocator, try allocator.dupe(u8, name), try value.clone(allocator));
+}
+
+fn resolveTaggedScalar(allocator: std.mem.Allocator, tag: []const u8, value: []const u8) !Node {
+    if (std.mem.eql(u8, tag, "tag:yaml.org,2002:null")) return .null;
+    if (std.mem.eql(u8, tag, "tag:yaml.org,2002:bool")) {
+        if (std.ascii.eqlIgnoreCase(value, "true")) return .{ .bool = true };
+        if (std.ascii.eqlIgnoreCase(value, "false")) return .{ .bool = false };
+    }
+    if (std.mem.eql(u8, tag, "tag:yaml.org,2002:int")) {
+        if (std.fmt.parseInt(i64, value, 10)) |n| return .{ .int = n } else |_| {}
+    }
+    return .{ .string = try allocator.dupe(u8, value) };
 }
 
 fn nodeToKeyString(allocator: std.mem.Allocator, node: Node) ![]u8 {

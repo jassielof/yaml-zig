@@ -20,12 +20,15 @@ pub const Kind = enum {
 pub const SequenceStart = struct {
     style: Token.CollectionStyle = .block,
     anchor: ?[]const u8 = null,
+    /// Tag text inside the test-suite brackets, such as `tag:yaml.org,2002:str`.
+    tag: ?[]const u8 = null,
     span: Span = .{},
 };
 
 pub const MappingStart = struct {
     style: Token.CollectionStyle = .block,
     anchor: ?[]const u8 = null,
+    tag: ?[]const u8 = null,
     span: Span = .{},
 };
 
@@ -33,7 +36,14 @@ pub const Scalar = struct {
     value: []const u8,
     style: Token.ScalarStyle = .plain,
     anchor: ?[]const u8 = null,
+    tag: ?[]const u8 = null,
     span: Span = .{},
+};
+
+pub const DocumentStart = struct {
+    span: Span = .{},
+    /// The document was introduced by an explicit `---` marker.
+    explicit: bool = false,
 };
 
 pub const Alias = struct {
@@ -45,7 +55,7 @@ kind: Kind,
 data: union(Kind) {
     stream_start: Span,
     stream_end: Span,
-    document_start: Span,
+    document_start: DocumentStart,
     document_end: Span,
     sequence_start: SequenceStart,
     sequence_end: Span,

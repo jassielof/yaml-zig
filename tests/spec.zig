@@ -160,7 +160,7 @@ fn classifyFixture(backend: Backend, id: []const u8) FixtureOutcome {
         return .{ .id = owned_id, .class = .unsupported, .err_name = "FileAccessError" };
 
     const has_expected = switch (backend) {
-        .yaml => has_error or has_json,
+        .yaml => has_error or has_json or has_events,
         .fy => if (has_error) true else has_events,
     };
     if (!has_expected) return .{ .id = owned_id, .class = .unsupported, .err_name = if (backend == .yaml) "no oracle" else "no test.event" };
@@ -211,6 +211,20 @@ fn runFixtureSemanticCheck(backend: Backend, id: []const u8) !void {
 
             const in_json_path = try std.fmt.allocPrint(testing.allocator, "tests/fixtures/{s}/in.json", .{id});
             defer testing.allocator.free(in_json_path);
+            if (!try pathExists(in_json_path)) {
+                const event_path = try std.fmt.allocPrint(testing.allocator, "tests/fixtures/{s}/test.event", .{id});
+                defer testing.allocator.free(event_path);
+                const expected_events = try readFileAlloc(testing.allocator, event_path);
+                defer testing.allocator.free(expected_events);
+                const actual_events = try yaml.formatTestsuiteEvents(testing.allocator, in_yaml);
+                defer testing.allocator.free(actual_events);
+                const normalized_expected = try stripCarriageReturnsAlloc(testing.allocator, expected_events);
+                defer testing.allocator.free(normalized_expected);
+                const normalized_actual = try stripCarriageReturnsAlloc(testing.allocator, actual_events);
+                defer testing.allocator.free(normalized_actual);
+                if (!std.mem.eql(u8, normalized_actual, normalized_expected)) return error.TestUnexpectedResult;
+                return;
+            }
             const in_json = try readFileAlloc(testing.allocator, in_json_path);
             defer testing.allocator.free(in_json);
 
@@ -382,6 +396,24 @@ fn diagnoseFixture(backend: Backend, id: []const u8) DiagResult {
             const json_path = std.fmt.allocPrint(testing.allocator, "tests/fixtures/{s}/in.json", .{id}) catch
                 return .{ .text = "?", .allocated = false };
             defer testing.allocator.free(json_path);
+            if (!(pathExists(json_path) catch false)) {
+                const event_path = std.fmt.allocPrint(testing.allocator, "tests/fixtures/{s}/test.event", .{id}) catch
+                    return .{ .text = "cannot read test.event", .allocated = false };
+                defer testing.allocator.free(event_path);
+                const expected_events = readFileAlloc(testing.allocator, event_path) catch
+                    return .{ .text = "cannot read test.event", .allocated = false };
+                defer testing.allocator.free(expected_events);
+                const actual_events = yaml.formatTestsuiteEvents(testing.allocator, yaml_src) catch |e|
+                    return .{ .text = @errorName(e), .allocated = false };
+                defer testing.allocator.free(actual_events);
+                const normalized_expected = stripCarriageReturnsAlloc(testing.allocator, expected_events) catch
+                    return .{ .text = "OutOfMemory", .allocated = false };
+                defer testing.allocator.free(normalized_expected);
+                const normalized_actual = stripCarriageReturnsAlloc(testing.allocator, actual_events) catch
+                    return .{ .text = "OutOfMemory", .allocated = false };
+                defer testing.allocator.free(normalized_actual);
+                return describeEventOutputMismatch(normalized_actual, normalized_expected);
+            }
             const json_src = readFileAlloc(testing.allocator, json_path) catch return .{ .text = "cannot read json", .allocated = false };
             defer testing.allocator.free(json_src);
 

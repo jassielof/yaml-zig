@@ -35,6 +35,8 @@ pub const ScannedLine = struct {
     after_comment: bool = false,
     /// A trailing `#` comment ended this line, so a plain scalar cannot continue.
     ends_with_comment: bool = false,
+    /// This line is the first node of a document introduced by `---`.
+    started_explicit: bool = false,
 };
 
 pub const ScannedDocument = struct {
@@ -93,6 +95,8 @@ pub fn scan(self: *Scanner) !ScannedDocument {
     var comment_pending = false;
     var saw_tag_directive = false;
     var doc_has_tag_directive = false;
+    var next_doc_explicit = false;
+    var awaiting_explicit_value = false;
 
     while (line_no < physical.items.len) : (line_no += 1) {
         const line = physical.items[line_no];
@@ -124,12 +128,15 @@ pub fn scan(self: *Scanner) !ScannedDocument {
                 emitted_in_doc = false;
             } else if (open_explicit) {
                 try self.appendMarker(.empty_document, line_no);
+                self.lines.items[self.lines.items.len - 1].started_explicit = true;
             }
             open_explicit = true;
             pending_directive = false;
             yaml_directive_count = 0;
             doc_has_tag_directive = saw_tag_directive;
             saw_tag_directive = false;
+            next_doc_explicit = true;
+            awaiting_explicit_value = false;
             if (rest.len == 0) continue;
             content = rest;
             from_marker = true;
@@ -143,10 +150,13 @@ pub fn scan(self: *Scanner) !ScannedDocument {
                 emitted_in_doc = false;
             } else if (open_explicit) {
                 try self.appendMarker(.empty_document, line_no);
+                self.lines.items[self.lines.items.len - 1].started_explicit = true;
+                next_doc_explicit = false;
             }
             open_explicit = false;
             pending_directive = false;
             doc_has_tag_directive = false;
+            awaiting_explicit_value = false;
             continue;
         }
 
@@ -184,7 +194,7 @@ pub fn scan(self: *Scanner) !ScannedDocument {
                 .style = sequence_style,
                 .span = makeSpan(line_no, indent, line.len),
             });
-            self.stampComment(&comment_pending, line_ends_with_comment);
+            self.stampComment(&comment_pending, line_ends_with_comment, &next_doc_explicit);
             continue;
         }
 
@@ -208,12 +218,36 @@ pub fn scan(self: *Scanner) !ScannedDocument {
                 .span = makeSpan(line_no, indent, line.len),
                 .explicit_key = true,
             });
-            self.stampComment(&comment_pending, line_ends_with_comment);
+            awaiting_explicit_value = true;
+            self.stampComment(&comment_pending, line_ends_with_comment, &next_doc_explicit);
             continue;
         }
 
         // Explicit mapping value: ": value" at the start of the line.
+        // Without a preceding `?`, this is an empty-key mapping entry (`: a`).
         if (content[0] == ':' and (content.len == 1 or content[1] == ' ' or content[1] == '\t')) {
+            if (!awaiting_explicit_value) {
+                const raw_value = if (content.len == 1)
+                    ""
+                else
+                    stripInlineComment(std.mem.trimStart(u8, content[2..], " \t"));
+                const value = try joinUnclosedFlow(self.allocator, physical.items, &line_no, raw_value, &owned, indent, false);
+                const value_style = detectStyle(value);
+                try ensureBlockHeader(value_style, value);
+                try self.lines.append(self.allocator, .{
+                    .line_no = line_no,
+                    .indent = indent,
+                    .kind = .mapping_entry,
+                    .key = "",
+                    .key_style = .plain,
+                    .value = trimPlainTrailing(value, value_style),
+                    .style = value_style,
+                    .span = makeSpan(line_no, indent, line.len),
+                });
+                self.stampComment(&comment_pending, line_ends_with_comment, &next_doc_explicit);
+                continue;
+            }
+            awaiting_explicit_value = false;
             const raw_value = if (content.len == 1)
                 ""
             else
@@ -229,7 +263,7 @@ pub fn scan(self: *Scanner) !ScannedDocument {
                 .style = value_style,
                 .span = makeSpan(line_no, indent, line.len),
             });
-            self.stampComment(&comment_pending, line_ends_with_comment);
+            self.stampComment(&comment_pending, line_ends_with_comment, &next_doc_explicit);
             continue;
         }
 
@@ -256,7 +290,7 @@ pub fn scan(self: *Scanner) !ScannedDocument {
                 .style = value_style,
                 .span = makeSpan(line_no, indent, line.len),
             });
-            self.stampComment(&comment_pending, line_ends_with_comment);
+            self.stampComment(&comment_pending, line_ends_with_comment, &next_doc_explicit);
             continue;
         }
 
@@ -273,7 +307,7 @@ pub fn scan(self: *Scanner) !ScannedDocument {
             .style = scalar_style,
             .span = makeSpan(line_no, indent, line.len),
         });
-        self.stampComment(&comment_pending, line_ends_with_comment);
+        self.stampComment(&comment_pending, line_ends_with_comment, &next_doc_explicit);
     }
 
     if (pending_directive) return Error.Parse.UnexpectedToken;
@@ -302,6 +336,7 @@ pub fn tokenizeFlow(
     // True after a quoted scalar until the next token. `:` then separates even
     // when it is not followed by whitespace (`"key":value`, `"foo"\n  :bar`).
     var json_key_ready = false;
+    var pending_anchor: []const u8 = "";
     while (i < text.len) {
         const c = text[i];
         if (c == ' ' or c == '\t' or c == '\n' or c == '\r') {
@@ -343,7 +378,9 @@ pub fn tokenizeFlow(
                         .lexeme = lexeme,
                         .span = makeSpan(line_no, start_col, column_base + i),
                         .scalar_style = .plain,
+                        .anchor = pending_anchor,
                     });
+                    pending_anchor = "";
                     continue;
                 }
                 json_key_ready = false;
@@ -369,15 +406,26 @@ pub fn tokenizeFlow(
                 continue;
             },
             '&' => {
-                // Anchors do not change the JSON value. Skip the name and parse the node.
                 json_key_ready = false;
                 i += 1;
+                const name_start = i;
                 while (i < text.len and isFlowNameChar(text[i])) : (i += 1) {}
+                pending_anchor = text[name_start..i];
                 continue;
             },
             '?' => {
-                if (i + 1 < text.len and (text[i + 1] == ' ' or text[i + 1] == '\t' or text[i + 1] == '\n' or text[i + 1] == '\r')) {
+                if (i + 1 >= text.len or text[i + 1] == ' ' or text[i + 1] == '\t' or text[i + 1] == '\n' or text[i + 1] == '\r' or text[i + 1] == ',' or text[i + 1] == '}' or text[i + 1] == ']') {
                     i += 1;
+                    var look = i;
+                    while (look < text.len and (text[look] == ' ' or text[look] == '\t' or text[look] == '\n' or text[look] == '\r')) : (look += 1) {}
+                    if (look >= text.len or text[look] == ',' or text[look] == '}' or text[look] == ']' or text[look] == ':') {
+                        try out.append(allocator, .{
+                            .kind = .scalar,
+                            .lexeme = "",
+                            .span = makeSpan(line_no, start_col, start_col + 1),
+                            .scalar_style = .plain,
+                        });
+                    }
                     continue;
                 }
                 const start = i;
@@ -390,7 +438,9 @@ pub fn tokenizeFlow(
                     .lexeme = lexeme,
                     .span = makeSpan(line_no, start_col, column_base + i),
                     .scalar_style = .plain,
+                    .anchor = pending_anchor,
                 });
+                pending_anchor = "";
                 continue;
             },
             '#' => {
@@ -449,7 +499,9 @@ pub fn tokenizeFlow(
                     .lexeme = lexeme,
                     .scalar_style = if (quote == '"') .double_quoted else .single_quoted,
                     .span = makeSpan(line_no, start_col, column_base + i),
+                    .anchor = pending_anchor,
                 });
+                pending_anchor = "";
                 json_key_ready = true;
                 continue;
             },
@@ -464,7 +516,9 @@ pub fn tokenizeFlow(
                     .lexeme = lexeme,
                     .span = makeSpan(line_no, column_base + start, column_base + i),
                     .scalar_style = .plain,
+                    .anchor = pending_anchor,
                 });
+                pending_anchor = "";
                 continue;
             },
         }
@@ -857,11 +911,13 @@ pub fn flowUnclosed(text: []const u8) bool {
 
 /// Pull following physical lines into `initial` until flow brackets and quotes balance.
 /// `index` is updated to the last consumed line.
-fn stampComment(self: *Scanner, comment_pending: *bool, ends_with_comment: bool) void {
+fn stampComment(self: *Scanner, comment_pending: *bool, ends_with_comment: bool, next_doc_explicit: *bool) void {
     const line = &self.lines.items[self.lines.items.len - 1];
     line.after_comment = comment_pending.*;
     line.ends_with_comment = ends_with_comment;
+    line.started_explicit = next_doc_explicit.*;
     comment_pending.* = false;
+    next_doc_explicit.* = false;
 }
 
 fn hasInlineComment(text: []const u8) bool {

@@ -29,10 +29,17 @@ pub fn deinit(self: *Parser) void {
             .scalar => {
                 self.allocator.free(ev.data.scalar.value);
                 if (ev.data.scalar.anchor) |anchor| self.allocator.free(anchor);
+                if (ev.data.scalar.tag) |tag| self.allocator.free(tag);
             },
             .alias => self.allocator.free(ev.data.alias.name),
-            .sequence_start => if (ev.data.sequence_start.anchor) |a| self.allocator.free(a),
-            .mapping_start => if (ev.data.mapping_start.anchor) |a| self.allocator.free(a),
+            .sequence_start => {
+                if (ev.data.sequence_start.anchor) |a| self.allocator.free(a);
+                if (ev.data.sequence_start.tag) |t| self.allocator.free(t);
+            },
+            .mapping_start => {
+                if (ev.data.mapping_start.anchor) |a| self.allocator.free(a);
+                if (ev.data.mapping_start.tag) |t| self.allocator.free(t);
+            },
             else => {},
         }
     }
@@ -51,9 +58,9 @@ pub fn parse(self: *Parser) ![]EventModel.Event {
             continue;
         }
 
-        try self.pushSimple(.document_start, .{});
+        try self.pushDocumentStart(line.started_explicit or line.kind == .empty_document);
         if (line.kind == .empty_document) {
-            try self.pushScalar("null", .plain, null, .{});
+            try self.pushScalar("", .plain, null, .{});
             self.index += 1;
         } else {
             try self.parseBlockValue(line.indent, true);
@@ -139,7 +146,7 @@ fn parseBlockValue(self: *Parser, indent: usize, is_root: bool) anyerror!void {
                             if (self.index < self.scanned.lines.items.len and self.scanned.lines.items[self.index].indent > next.indent) {
                                 try self.parseBlockValue(self.scanned.lines.items[self.index].indent, false);
                             } else {
-                                try self.pushScalar("null", .plain, null, sl.span);
+                                try self.pushScalar("", .plain, null, sl.span);
                             }
                         } else {
                             try self.parseScalarLikeValue(sl.value, sl.style, sl.line_no, sl.indent + 2);
@@ -197,7 +204,7 @@ fn parseBlockSequence(self: *Parser, indent: usize) anyerror!void {
             if (self.index < self.scanned.lines.items.len and self.scanned.lines.items[self.index].indent > indent) {
                 try self.parseBlockValue(self.scanned.lines.items[self.index].indent, false);
             } else {
-                try self.pushScalar("null", .plain, null, line.span);
+                try self.pushScalar("", .plain, null, line.span);
             }
             continue;
         }
@@ -205,7 +212,6 @@ fn parseBlockSequence(self: *Parser, indent: usize) anyerror!void {
         // Check for virtual-empty value (only anchor/tag, no real content)
         if (line.style == .plain and isVirtualEmptyValue(line.value, .plain)) {
             const raw_trimmed = std.mem.trim(u8, line.value, " ");
-            const has_str = std.mem.startsWith(u8, raw_trimmed, "!!str");
             const vs = stripTagPrefix(raw_trimmed);
             const vs_anc = extractLeadingAnchor(vs);
             const seq_anc: ?[]const u8 = if (vs_anc.name.len > 0) vs_anc.name else null;
@@ -217,11 +223,8 @@ fn parseBlockSequence(self: *Parser, indent: usize) anyerror!void {
                     continue;
                 }
             }
-            if (has_str) {
-                try self.pushScalar("", .double_quoted, seq_anc, line.span);
-            } else {
-                try self.pushScalar("null", .plain, seq_anc, line.span);
-            }
+            try self.pushScalar("", .plain, seq_anc, line.span);
+            try self.tagLastScalar(canonicalTag(raw_trimmed));
             continue;
         }
 
@@ -240,7 +243,7 @@ fn parseBlockSequence(self: *Parser, indent: usize) anyerror!void {
                 if (self.index < self.scanned.lines.items.len and self.scanned.lines.items[self.index].indent > nested_indent) {
                     try self.parseBlockValue(self.scanned.lines.items[self.index].indent, false);
                 } else {
-                    try self.pushScalar("null", .plain, null, line.span);
+                    try self.pushScalar("", .plain, null, line.span);
                 }
             } else if (inner_item.len >= 2 and inner_item[0] == '-' and (inner_item[1] == ' ' or inner_item[1] == '\t')) {
                 try self.emitNestedSequenceValue(inner_item, nested_indent, line.line_no, line.span);
@@ -264,7 +267,7 @@ fn parseBlockSequence(self: *Parser, indent: usize) anyerror!void {
                     if (self.index < self.scanned.lines.items.len and self.scanned.lines.items[self.index].indent > nested_indent) {
                         try self.parseBlockValue(self.scanned.lines.items[self.index].indent, false);
                     } else {
-                        try self.pushScalar("null", .plain, null, nl.span);
+                        try self.pushScalar("", .plain, null, nl.span);
                     }
                 } else {
                     try self.parseScalarLikeValue(nl.value, nl.style, nl.line_no, nested_indent + 2);
@@ -327,26 +330,17 @@ fn parseBlockSequence(self: *Parser, indent: usize) anyerror!void {
 }
 
 fn emitSequenceItemMapping(self: *Parser, line: Scanner.ScannedLine, seq_indent: usize) anyerror!void {
-    var working = stripTagPrefix(std.mem.trim(u8, line.value, " "));
-    const anchor_info = extractLeadingAnchor(working);
-    if (anchor_info.name.len > 0) {
-        working = anchor_info.rest;
-    }
-
-    const col_idx = Scanner.findInlineMappingColon(working) orelse unreachable;
-    const key = std.mem.trimEnd(u8, working[0..col_idx], " \t");
-    const raw_val = std.mem.trimStart(u8, working[col_idx + 1 ..], " \t");
+    const original = std.mem.trim(u8, line.value, " ");
+    const col_idx = Scanner.findInlineMappingColon(original) orelse unreachable;
+    const key = std.mem.trimEnd(u8, original[0..col_idx], " \t");
+    const raw_val = std.mem.trimStart(u8, original[col_idx + 1 ..], " \t");
 
     try self.events.append(self.allocator, .{
         .kind = .mapping_start,
         .data = .{ .mapping_start = .{ .style = .block } },
     });
 
-    // Emit first key
-    const ks = detectInlineStyle(key);
-    const nk = try normalizeScalar(self.allocator, key, ks);
-    defer self.allocator.free(nk);
-    try self.pushScalar(nk, ks, null, .{});
+    try self.parseScalarLikeValue(key, detectInlineStyle(key), line.line_no, line.indent);
 
     // Emit first value
     if (raw_val.len == 0) {
@@ -354,7 +348,7 @@ fn emitSequenceItemMapping(self: *Parser, line: Scanner.ScannedLine, seq_indent:
         if (self.index < self.scanned.lines.items.len and self.scanned.lines.items[self.index].indent > seq_indent) {
             try self.parseBlockValue(self.scanned.lines.items[self.index].indent, false);
         } else {
-            try self.pushScalar("null", .plain, null, .{});
+            try self.pushScalar("", .plain, null, .{});
         }
     } else {
         const vs = detectInlineStyle(raw_val);
@@ -396,7 +390,7 @@ fn emitVirtualEmptyBlock(self: *Parser, next_line: Scanner.ScannedLine, anchor: 
                 if (self.index < self.scanned.lines.items.len and self.scanned.lines.items[self.index].indent > seq_indent) {
                     try self.parseBlockValue(self.scanned.lines.items[self.index].indent, false);
                 } else {
-                    try self.pushScalar("null", .plain, null, sl.span);
+                    try self.pushScalar("", .plain, null, sl.span);
                 }
             } else {
                 try self.parseScalarLikeValue(sl.value, sl.style, sl.line_no, sl.indent + 2);
@@ -440,7 +434,7 @@ fn emitInlineMappingValue(self: *Parser, text: []const u8, parent_indent: usize,
     defer self.allocator.free(nk);
     try self.pushScalar(nk, ks, null, .{});
     if (raw_val.len == 0) {
-        try self.pushScalar("null", .plain, null, .{});
+        try self.pushScalar("", .plain, null, .{});
     } else {
         try self.parseScalarLikeValue(raw_val, detectInlineStyle(raw_val), line_no, parent_indent + 2);
     }
@@ -456,7 +450,7 @@ fn emitNestedSequenceValue(self: *Parser, value: []const u8, parent_indent: usiz
         });
         const inner = std.mem.trimStart(u8, trimmed[2..], " \t");
         if (inner.len == 0) {
-            try self.pushScalar("null", .plain, null, span);
+            try self.pushScalar("", .plain, null, span);
         } else if (inner.len >= 2 and inner[0] == '-' and (inner[1] == ' ' or inner[1] == '\t')) {
             try self.emitNestedSequenceValue(inner, parent_indent + 2, line_no, span);
         } else {
@@ -494,8 +488,12 @@ fn emitSingleMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_inden
     const key_anchor: ?[]const u8 = if (key_anchor_info.name.len > 0) key_anchor_info.name else null;
     const key_without_anchor = stripTagPrefix(std.mem.trim(u8, if (key_anchor != null) key_anchor_info.rest else stripAnchorPrefix(key_without_tag), " "));
     if (line.key_style == .plain) {
-        if (key_anchor != null and isAliasToken(key_without_anchor) != null) return Error.Parse.UnexpectedToken;
-        if (isAliasToken(key_without_anchor)) |alias_name| {
+        const raw_key = std.mem.trim(u8, line.key, " ");
+        if (mappingKeyIsNode(raw_key)) {
+            try self.parseScalarLikeValue(raw_key, .plain, line.line_no, line.indent);
+        } else if (key_anchor != null and isAliasToken(key_without_anchor) != null) {
+            return Error.Parse.UnexpectedToken;
+        } else if (isAliasToken(key_without_anchor)) |alias_name| {
             try self.events.append(self.allocator, .{
                 .kind = .alias,
                 .data = .{ .alias = .{ .name = try self.allocator.dupe(u8, alias_name), .span = line.span } },
@@ -504,12 +502,12 @@ fn emitSingleMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_inden
             const effective_key_style = detectInlineStyle(key_without_anchor);
             const normalized_key = try normalizeScalar(self.allocator, key_without_anchor, effective_key_style);
             defer self.allocator.free(normalized_key);
-            try self.pushScalar(normalized_key, .plain, key_anchor, line.span);
+            try self.pushScalar(normalized_key, effective_key_style, key_anchor, line.span);
         }
     } else {
         const normalized_key = try normalizeScalar(self.allocator, key_without_anchor, line.key_style);
         defer self.allocator.free(normalized_key);
-        try self.pushScalar(normalized_key, .plain, key_anchor, line.span);
+        try self.pushScalar(normalized_key, line.key_style, key_anchor, line.span);
     }
 
     // Emit value
@@ -542,7 +540,7 @@ fn emitSingleMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_inden
                                 if (self.index < self.scanned.lines.items.len and self.scanned.lines.items[self.index].indent > next.indent) {
                                     try self.parseBlockValue(self.scanned.lines.items[self.index].indent, false);
                                 } else {
-                                    try self.pushScalar("null", .plain, null, sl.span);
+                                    try self.pushScalar("", .plain, null, sl.span);
                                 }
                             } else {
                                 try self.parseScalarLikeValue(sl.value, sl.style, sl.line_no, sl.indent + 2);
@@ -607,7 +605,7 @@ fn emitSingleMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_inden
                                                 if (self.index < self.scanned.lines.items.len and self.scanned.lines.items[self.index].indent > nn.indent) {
                                                     try self.parseBlockValue(self.scanned.lines.items[self.index].indent, false);
                                                 } else {
-                                                    try self.pushScalar("null", .plain, null, sl.span);
+                                                    try self.pushScalar("", .plain, null, sl.span);
                                                 }
                                             } else {
                                                 try self.parseScalarLikeValue(sl.value, sl.style, sl.line_no, sl.indent + 2);
@@ -675,7 +673,7 @@ fn emitSingleMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_inden
                             if (self.index < self.scanned.lines.items.len and self.scanned.lines.items[self.index].indent > parent_indent) {
                                 try self.parseBlockValue(self.scanned.lines.items[self.index].indent, false);
                             } else {
-                                try self.pushScalar("null", .plain, null, sl.span);
+                                try self.pushScalar("", .plain, null, sl.span);
                             }
                         } else {
                             try self.parseScalarLikeValue(sl.value, sl.style, sl.line_no, sl.indent + 2);
@@ -686,10 +684,12 @@ fn emitSingleMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_inden
                     try self.parseBlockSequence(parent_indent);
                 }
             } else {
-                try self.pushScalar("null", .plain, maybe_anchor, line.span);
+                try self.pushScalar("", .plain, maybe_anchor, line.span);
+                try self.tagLastScalar(canonicalTag(line.value));
             }
         } else {
-            try self.pushScalar("null", .plain, maybe_anchor, line.span);
+            try self.pushScalar("", .plain, maybe_anchor, line.span);
+            try self.tagLastScalar(canonicalTag(line.value));
         }
         return;
     }
@@ -754,19 +754,43 @@ fn emitSingleMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_inden
 }
 
 fn emitExplicitMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_indent: usize) anyerror!void {
-    const key_text = try self.collectExplicitKey(line, parent_indent);
-    defer self.allocator.free(key_text);
-    const normalized_key = try normalizeScalar(self.allocator, key_text, .plain);
-    defer self.allocator.free(normalized_key);
-    try self.pushScalar(normalized_key, .plain, null, line.span);
+    const key_raw = std.mem.trim(u8, if (std.mem.eql(u8, line.key, "~")) "" else line.key, " \t");
+    if (isCompactSequence(key_raw)) {
+        self.index += 1;
+        try self.emitCompactSequence(parent_indent, key_raw, line.span, line.line_no);
+    } else if (key_raw.len > 0 and (key_raw[0] == '[' or key_raw[0] == '{' or key_raw[0] == '&' or key_raw[0] == '!')) {
+        self.index += 1;
+        try self.parseScalarLikeValue(key_raw, .plain, line.line_no, line.indent);
+    } else if (key_raw.len == 0) {
+        self.index += 1;
+        if (self.index < self.scanned.lines.items.len) {
+            const next = self.scanned.lines.items[self.index];
+            if (next.kind == .sequence_item and next.indent >= parent_indent) {
+                try self.parseBlockSequence(next.indent);
+            } else if (next.kind == .mapping_entry and !next.explicit_key and next.indent >= parent_indent) {
+                try self.parseBlockMapping(next.indent);
+            } else {
+                try self.pushScalar("", .plain, null, line.span);
+            }
+        } else {
+            try self.pushScalar("", .plain, null, line.span);
+        }
+    } else {
+        const key_text = try self.collectExplicitKey(line, parent_indent);
+        defer self.allocator.free(key_text);
+        const key_style = line.key_style;
+        const normalized_key = try normalizeScalar(self.allocator, key_text, if (key_style == .literal or key_style == .folded) .plain else key_style);
+        defer self.allocator.free(normalized_key);
+        try self.pushScalar(normalized_key, key_style, null, line.span);
+    }
 
     if (self.index >= self.scanned.lines.items.len) {
-        try self.pushScalar("null", .plain, null, line.span);
+        try self.pushScalar("", .plain, null, line.span);
         return;
     }
     const next = self.scanned.lines.items[self.index];
     if (next.kind != .explicit_value or next.indent != parent_indent) {
-        try self.pushScalar("null", .plain, null, line.span);
+        try self.pushScalar("", .plain, null, line.span);
         return;
     }
 
@@ -794,13 +818,18 @@ fn emitExplicitMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_ind
         return;
     }
     if (trimmed.len == 0) {
-        if (self.index < self.scanned.lines.items.len and self.scanned.lines.items[self.index].indent > parent_indent and
-            self.scanned.lines.items[self.index].kind != .document_end)
-        {
-            try self.parseBlockValue(self.scanned.lines.items[self.index].indent, false);
-        } else {
-            try self.pushScalar("null", .plain, null, value_span);
+        if (self.index < self.scanned.lines.items.len and self.scanned.lines.items[self.index].kind != .document_end) {
+            const nested = self.scanned.lines.items[self.index];
+            if (nested.kind == .sequence_item and nested.indent >= parent_indent) {
+                try self.parseBlockSequence(nested.indent);
+                return;
+            }
+            if (nested.indent > parent_indent) {
+                try self.parseBlockValue(nested.indent, false);
+                return;
+            }
         }
+        try self.pushScalar("", .plain, null, value_span);
         return;
     }
 
@@ -856,7 +885,7 @@ fn emitCompactSequence(self: *Parser, parent_indent: usize, first: []const u8, s
 
     const inner = if (first.len <= 1) "" else std.mem.trimStart(u8, first[2..], " \t");
     if (inner.len == 0) {
-        try self.pushScalar("null", .plain, null, span);
+        try self.pushScalar("", .plain, null, span);
     } else if (isCompactSequence(inner)) {
         try self.emitCompactSequence(nested_indent, inner, span, line_no);
     } else {
@@ -871,7 +900,7 @@ fn emitCompactSequence(self: *Parser, parent_indent: usize, first: []const u8, s
         if (isCompactSequence(trimmed)) {
             try self.emitCompactSequence(nl.indent, trimmed, nl.span, nl.line_no);
         } else if (trimmed.len == 0) {
-            try self.pushScalar("null", .plain, null, nl.span);
+            try self.pushScalar("", .plain, null, nl.span);
         } else {
             try self.parseScalarLikeValue(trimmed, nl.style, nl.line_no, nested_indent);
         }
@@ -1073,45 +1102,21 @@ fn parseScalarLikeValue(
     var working_style = style;
     var anchor_name: ?[]const u8 = null;
 
-    var has_nonspecific_tag = false;
-    var has_str_tag = false;
     if (working_style == .plain) {
-        const before_tag = working;
         working = stripTagPrefix(working);
-        if (!std.mem.eql(u8, before_tag, working)) {
-            const trimmed_bt = std.mem.trimStart(u8, before_tag, " ");
-            if (std.mem.startsWith(u8, trimmed_bt, "! ") or std.mem.eql(u8, trimmed_bt, "!")) {
-                has_nonspecific_tag = true;
-            }
-            if (std.mem.startsWith(u8, trimmed_bt, "!!str")) {
-                has_str_tag = true;
-            }
-        }
         const extracted = extractLeadingAnchor(working);
         if (extracted.name.len > 0) {
             anchor_name = extracted.name;
             working = extracted.rest;
         }
-        const before_tag2 = working;
         working = stripTagPrefix(working);
-        if (!std.mem.eql(u8, before_tag2, working)) {
-            const trimmed_bt2 = std.mem.trimStart(u8, before_tag2, " ");
-            if (!has_nonspecific_tag and (std.mem.startsWith(u8, trimmed_bt2, "! ") or std.mem.eql(u8, trimmed_bt2, "!"))) {
-                has_nonspecific_tag = true;
-            }
-            if (std.mem.startsWith(u8, trimmed_bt2, "!!str")) {
-                has_str_tag = true;
-            }
-        }
         working_style = detectInlineStyle(working);
     }
 
+    if (std.mem.eql(u8, std.mem.trim(u8, working, " \t"), "!")) working = "";
     if (working.len == 0) {
-        if (has_str_tag or has_nonspecific_tag) {
-            try self.pushScalar("", .double_quoted, anchor_name, .{});
-        } else {
-            try self.pushScalar("null", .plain, anchor_name, .{});
-        }
+        try self.pushScalar("", .plain, anchor_name, .{});
+        try self.tagLastScalar(canonicalTag(value));
         return;
     }
 
@@ -1162,10 +1167,11 @@ fn parseScalarLikeValue(
         }
     }
 
-    const final_style: Token.ScalarStyle = if (has_nonspecific_tag and working_style == .plain) .double_quoted else working_style;
+    const final_style: Token.ScalarStyle = working_style;
     const scalar = try normalizeScalar(self.allocator, working, final_style);
     defer self.allocator.free(scalar);
     try self.pushScalar(scalar, final_style, anchor_name, .{});
+    try self.tagLastScalar(canonicalTag(value));
 }
 
 fn detectInlineStyle(value: []const u8) Token.ScalarStyle {
@@ -1205,7 +1211,7 @@ fn parseFlowValue(self: *Parser, tokens: []const Token.Token, cursor: *usize) an
                 const entry_at = self.events.items.len;
                 if (tokens[cursor.*].kind == .colon) {
                     if (tokens[cursor.*].indent != 0) return Error.Parse.UnexpectedToken;
-                    try self.pushScalar("null", .plain, null, tokens[cursor.*].span);
+                    try self.pushScalar("", .plain, null, tokens[cursor.*].span);
                 } else {
                     try self.parseFlowValue(tokens, cursor);
                 }
@@ -1217,7 +1223,7 @@ fn parseFlowValue(self: *Parser, tokens: []const Token.Token, cursor: *usize) an
                     });
                     cursor.* += 1;
                     if (cursor.* >= tokens.len or tokens[cursor.*].kind == .comma or tokens[cursor.*].kind == .rbracket or tokens[cursor.*].kind == .eof) {
-                        try self.pushScalar("null", .plain, null, tok.span);
+                        try self.pushScalar("", .plain, null, tok.span);
                     } else {
                         try self.parseFlowValue(tokens, cursor);
                     }
@@ -1240,18 +1246,19 @@ fn parseFlowValue(self: *Parser, tokens: []const Token.Token, cursor: *usize) an
                 if (key.kind != .scalar) return Error.Parse.UnexpectedToken;
                 const norm_key = try normalizeScalar(self.allocator, key.lexeme, key.scalar_style);
                 defer self.allocator.free(norm_key);
-                try self.pushScalar(norm_key, key.scalar_style, null, key.span);
+                const flow_anchor: ?[]const u8 = if (key.anchor.len > 0) key.anchor else null;
+                try self.pushScalar(norm_key, key.scalar_style, flow_anchor, key.span);
                 cursor.* += 1;
                 if (cursor.* >= tokens.len) return Error.Parse.UnexpectedToken;
                 if (tokens[cursor.*].kind == .colon) {
                     cursor.* += 1;
                     if (cursor.* >= tokens.len or tokens[cursor.*].kind == .comma or tokens[cursor.*].kind == .rbrace or tokens[cursor.*].kind == .rbracket or tokens[cursor.*].kind == .eof) {
-                        try self.pushScalar("null", .plain, null, key.span);
+                        try self.pushScalar("", .plain, null, key.span);
                     } else {
                         try self.parseFlowValue(tokens, cursor);
                     }
                 } else {
-                    try self.pushScalar("null", .plain, null, key.span);
+                    try self.pushScalar("", .plain, null, key.span);
                 }
                 if (cursor.* < tokens.len and tokens[cursor.*].kind == .comma) cursor.* += 1;
             }
@@ -1269,7 +1276,8 @@ fn parseFlowValue(self: *Parser, tokens: []const Token.Token, cursor: *usize) an
         .scalar => {
             const normalized = try normalizeScalar(self.allocator, tok.lexeme, tok.scalar_style);
             defer self.allocator.free(normalized);
-            try self.pushScalar(normalized, tok.scalar_style, null, tok.span);
+            const flow_anchor: ?[]const u8 = if (tok.anchor.len > 0) tok.anchor else null;
+            try self.pushScalar(normalized, tok.scalar_style, flow_anchor, tok.span);
             cursor.* += 1;
         },
         .eof => {},
@@ -1660,6 +1668,34 @@ fn stripCR(line: []const u8) []const u8 {
     return line;
 }
 
+fn mappingKeyIsNode(raw: []const u8) bool {
+    if (raw.len == 0) return false;
+    if (raw[0] == '[' or raw[0] == '{' or raw[0] == '!') return true;
+    if (raw[0] == '&') {
+        const rest = extractLeadingAnchor(raw).rest;
+        return rest.len > 0 and (rest[0] == '[' or rest[0] == '{');
+    }
+    return false;
+}
+
+fn canonicalTag(raw: []const u8) ?[]const u8 {
+    const text = std.mem.trimStart(u8, raw, " \t");
+    if (std.mem.startsWith(u8, text, "!!str")) return "tag:yaml.org,2002:str";
+    if (std.mem.startsWith(u8, text, "!!null")) return "tag:yaml.org,2002:null";
+    if (std.mem.startsWith(u8, text, "!!map")) return "tag:yaml.org,2002:map";
+    if (std.mem.startsWith(u8, text, "!!seq")) return "tag:yaml.org,2002:seq";
+    if (std.mem.eql(u8, text, "!") or std.mem.startsWith(u8, text, "! ")) return "!";
+    return null;
+}
+
+fn tagLastScalar(self: *Parser, tag: ?[]const u8) !void {
+    const text = tag orelse return;
+    if (self.events.items.len == 0) return;
+    const ev = &self.events.items[self.events.items.len - 1];
+    if (ev.kind != .scalar or ev.data.scalar.tag != null) return;
+    ev.data.scalar.tag = try self.allocator.dupe(u8, text);
+}
+
 fn looksLikeStructure(content: []const u8) bool {
     if (content.len == 0) return false;
     if (content[0] == '-' and (content.len == 1 or content[1] == ' ' or content[1] == '\t')) return true;
@@ -1685,6 +1721,13 @@ fn isSpace(c: u8) bool {
     return c == ' ' or c == '\t' or c == '\n' or c == '\r';
 }
 
+fn pushDocumentStart(self: *Parser, explicit: bool) anyerror!void {
+    try self.events.append(self.allocator, .{
+        .kind = .document_start,
+        .data = .{ .document_start = .{ .explicit = explicit } },
+    });
+}
+
 fn pushScalar(self: *Parser, value: []const u8, style: Token.ScalarStyle, anchor: ?[]const u8, span: @import("Span.zig")) anyerror!void {
     try self.events.append(self.allocator, .{
         .kind = .scalar,
@@ -1703,7 +1746,7 @@ fn pushSimple(self: *Parser, kind: EventModel.Kind, span: @import("Span.zig")) a
         .data = switch (kind) {
             .stream_start => .{ .stream_start = span },
             .stream_end => .{ .stream_end = span },
-            .document_start => .{ .document_start = span },
+            .document_start => .{ .document_start = .{ .span = span } },
             .document_end => .{ .document_end = span },
             .sequence_end => .{ .sequence_end = span },
             .mapping_end => .{ .mapping_end = span },

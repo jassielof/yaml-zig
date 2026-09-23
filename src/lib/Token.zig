@@ -41,3 +41,5 @@ span: Span = .{},
 lexeme: []const u8 = "",
 scalar_style: ScalarStyle = .plain,
 indent: usize = 0,
+/// Anchor name attached to this flow node. Empty when there is none.
+anchor: []const u8 = "",
