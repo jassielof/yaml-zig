@@ -116,7 +116,9 @@ fn parseBlockValue(self: *Parser, indent: usize, is_root: bool) anyerror!void {
         // Check if value is just tags/anchors — look ahead for block structure
         const stripped = stripTagPrefix(std.mem.trim(u8, joined, " "));
         const anc = extractLeadingAnchor(stripped);
-        const rest_after = std.mem.trim(u8, stripAnchorPrefix(stripped), " ");
+        // Tags may follow the anchor (`&a4 !!map`), so strip both before deciding
+        // that the line is only node properties.
+        const rest_after = std.mem.trim(u8, stripTagPrefix(stripAnchorPrefix(stripped)), " ");
         if (rest_after.len == 0 and self.index < self.scanned.lines.items.len) {
             const next = self.scanned.lines.items[self.index];
             const anchor_to_attach = if (anc.name.len > 0) anc.name else null;
@@ -295,20 +297,24 @@ fn parseBlockSequence(self: *Parser, indent: usize) anyerror!void {
             var final_text = try self.collectPlainContinuation(indent + 1, line.value);
             defer self.allocator.free(final_text);
 
-            // Absorb sequence_item lines at indent > seq_indent as plain text (AB8U)
-            while (self.index < self.scanned.lines.items.len) {
-                const nl = self.scanned.lines.items[self.index];
-                if (nl.kind != .sequence_item or nl.indent <= indent) break;
-                const trimmed = std.mem.trim(u8, nl.value, " ");
-                const new_buf = try self.allocator.alloc(u8, final_text.len + 3 + trimmed.len);
-                @memcpy(new_buf[0..final_text.len], final_text);
-                new_buf[final_text.len] = ' ';
-                new_buf[final_text.len + 1] = '-';
-                new_buf[final_text.len + 2] = ' ';
-                @memcpy(new_buf[final_text.len + 3 ..][0..trimmed.len], trimmed);
-                self.allocator.free(final_text);
-                final_text = new_buf[0 .. final_text.len + 3 + trimmed.len];
-                self.index += 1;
+            // Absorb sequence_item lines at indent > seq_indent as plain text (AB8U).
+            // A comment ends that plain scalar, so later dashes stay structure.
+            if (!line.ends_with_comment) {
+                while (self.index < self.scanned.lines.items.len) {
+                    const nl = self.scanned.lines.items[self.index];
+                    if (nl.after_comment) break;
+                    if (nl.kind != .sequence_item or nl.indent <= indent) break;
+                    const trimmed = std.mem.trim(u8, nl.value, " ");
+                    const new_buf = try self.allocator.alloc(u8, final_text.len + 3 + trimmed.len);
+                    @memcpy(new_buf[0..final_text.len], final_text);
+                    new_buf[final_text.len] = ' ';
+                    new_buf[final_text.len + 1] = '-';
+                    new_buf[final_text.len + 2] = ' ';
+                    @memcpy(new_buf[final_text.len + 3 ..][0..trimmed.len], trimmed);
+                    self.allocator.free(final_text);
+                    final_text = new_buf[0 .. final_text.len + 3 + trimmed.len];
+                    self.index += 1;
+                }
             }
             try self.parseScalarLikeValue(final_text, .plain, line.line_no, line.indent + 2);
         } else {
@@ -486,8 +492,9 @@ fn emitSingleMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_inden
     const key_without_tag = stripTagPrefix(std.mem.trim(u8, line.key, " "));
     const key_anchor_info = extractLeadingAnchor(key_without_tag);
     const key_anchor: ?[]const u8 = if (key_anchor_info.name.len > 0) key_anchor_info.name else null;
-    const key_without_anchor = if (key_anchor != null) key_anchor_info.rest else stripAnchorPrefix(key_without_tag);
+    const key_without_anchor = stripTagPrefix(std.mem.trim(u8, if (key_anchor != null) key_anchor_info.rest else stripAnchorPrefix(key_without_tag), " "));
     if (line.key_style == .plain) {
+        if (key_anchor != null and isAliasToken(key_without_anchor) != null) return Error.Parse.UnexpectedToken;
         if (isAliasToken(key_without_anchor)) |alias_name| {
             try self.events.append(self.allocator, .{
                 .kind = .alias,
@@ -833,7 +840,11 @@ fn collectExplicitPlainValue(self: *Parser, parent_indent: usize, initial: []con
 }
 
 fn emitCompactSequence(self: *Parser, parent_indent: usize, first: []const u8, span: @import("Span.zig"), line_no: usize) anyerror!void {
-    const nested_indent = parent_indent + 2;
+    var nested_indent = parent_indent + 2;
+    if (self.index < self.scanned.lines.items.len) {
+        const nxt = self.scanned.lines.items[self.index];
+        if (nxt.kind == .sequence_item and nxt.indent > parent_indent) nested_indent = nxt.indent;
+    }
     try self.events.append(self.allocator, .{
         .kind = .sequence_start,
         .data = .{ .sequence_start = .{ .style = .block } },
@@ -842,6 +853,8 @@ fn emitCompactSequence(self: *Parser, parent_indent: usize, first: []const u8, s
     const inner = if (first.len <= 1) "" else std.mem.trimStart(u8, first[2..], " \t");
     if (inner.len == 0) {
         try self.pushScalar("null", .plain, null, span);
+    } else if (isCompactSequence(inner)) {
+        try self.emitCompactSequence(nested_indent, inner, span, line_no);
     } else {
         try self.parseScalarLikeValue(inner, detectInlineStyle(inner), line_no, nested_indent);
     }
@@ -849,14 +862,21 @@ fn emitCompactSequence(self: *Parser, parent_indent: usize, first: []const u8, s
     while (self.index < self.scanned.lines.items.len) {
         const nl = self.scanned.lines.items[self.index];
         if (nl.indent != nested_indent or nl.kind != .sequence_item) break;
+        const trimmed = std.mem.trimStart(u8, nl.value, " \t");
         self.index += 1;
-        if (nl.value.len == 0) {
+        if (isCompactSequence(trimmed)) {
+            try self.emitCompactSequence(nl.indent, trimmed, nl.span, nl.line_no);
+        } else if (trimmed.len == 0) {
             try self.pushScalar("null", .plain, null, nl.span);
         } else {
-            try self.parseScalarLikeValue(nl.value, nl.style, nl.line_no, nested_indent);
+            try self.parseScalarLikeValue(trimmed, nl.style, nl.line_no, nested_indent);
         }
     }
     try self.pushSimple(.sequence_end, .{});
+}
+
+fn isCompactSequence(text: []const u8) bool {
+    return text.len >= 1 and text[0] == '-' and (text.len == 1 or text[1] == ' ' or text[1] == '\t');
 }
 
 fn collectBlockScalar(
@@ -1081,7 +1101,8 @@ fn parseScalarLikeValue(
         return;
     }
 
-    if (working_style == .plain and working[0] == '*') {
+    if (working_style == .plain and working.len > 0 and working[0] == '*') {
+        if (anchor_name != null) return Error.Parse.UnexpectedToken;
         var end: usize = 1;
         while (end < working.len and Scanner.isBlockAnchorChar(working[end])) : (end += 1) {}
         const alias_name = working[1..end];
@@ -1397,12 +1418,17 @@ fn collectPlainContinuation(self: *Parser, min_indent: usize, initial: []const u
 
     try out.appendSlice(self.allocator, std.mem.trim(u8, initial, " "));
 
-    var prev_line_no = self.scanned.lines.items[self.index].line_no;
+    const start = self.scanned.lines.items[self.index];
+    var prev_line_no = start.line_no;
     self.index += 1;
+    // A trailing comment ends the plain scalar (`word1 # comment` / `word2`).
+    if (start.ends_with_comment) return out.toOwnedSlice(self.allocator);
 
     while (self.index < self.scanned.lines.items.len) {
         const line = self.scanned.lines.items[self.index];
         if (line.indent < min_indent or line.kind != .scalar) break;
+        // A comment-only line between plain lines ends the scalar.
+        if (line.after_comment) break;
 
         const gap = if (line.line_no > prev_line_no) line.line_no - prev_line_no - 1 else 0;
         if (gap > 0) {
@@ -1415,6 +1441,7 @@ fn collectPlainContinuation(self: *Parser, min_indent: usize, initial: []const u
         try out.appendSlice(self.allocator, std.mem.trim(u8, line.value, " "));
         prev_line_no = line.line_no;
         self.index += 1;
+        if (line.ends_with_comment) break;
     }
 
     return out.toOwnedSlice(self.allocator);
@@ -1433,6 +1460,7 @@ fn collectMultilineQuotedScalar(self: *Parser, base_indent: usize, style: Token.
 
     while (self.index < self.scanned.lines.items.len and !hasClosingQuote(out.items, quote)) {
         const line = self.scanned.lines.items[self.index];
+        if (line.kind == .document_end or line.kind == .empty_document) break;
         if (line.indent < base_indent) break;
 
         const gap = if (line.line_no > prev_line_no) line.line_no - prev_line_no - 1 else 0;
@@ -1478,6 +1506,7 @@ fn collectMultilineQuotedValue(self: *Parser, base_indent: usize, initial: []con
 
     while (self.index < self.scanned.lines.items.len and !hasClosingQuote(out.items, quote)) {
         const line = self.scanned.lines.items[self.index];
+        if (line.kind == .document_end or line.kind == .empty_document) break;
         if (line.indent < base_indent) break;
 
         const gap = if (line.line_no > prev_line_no) line.line_no - prev_line_no - 1 else 0;

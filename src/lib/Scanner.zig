@@ -31,6 +31,10 @@ pub const ScannedLine = struct {
     /// The key was introduced by `?`, so following indented lines belong to the key
     /// until a matching `:` line.
     explicit_key: bool = false,
+    /// A comment-only line separates this line from the previous content line.
+    after_comment: bool = false,
+    /// A trailing `#` comment ended this line, so a plain scalar cannot continue.
+    ends_with_comment: bool = false,
 };
 
 pub const ScannedDocument = struct {
@@ -86,12 +90,18 @@ pub fn scan(self: *Scanner) !ScannedDocument {
     var open_explicit = false;
     var pending_directive = false;
     var yaml_directive_count: usize = 0;
+    var comment_pending = false;
 
     while (line_no < physical.items.len) : (line_no += 1) {
         const line = physical.items[line_no];
         const indent = countIndent(line);
-        var content = stripInlineComment(std.mem.trimStart(u8, line[indent..], " "));
-        if (content.len == 0 or std.mem.startsWith(u8, content, "#")) continue;
+        const raw_content = std.mem.trimStart(u8, line[indent..], " ");
+        const line_ends_with_comment = hasInlineComment(raw_content);
+        var content = stripInlineComment(raw_content);
+        if (content.len == 0 or std.mem.startsWith(u8, content, "#")) {
+            if (raw_content.len > 0 and raw_content[0] == '#') comment_pending = true;
+            continue;
+        }
 
         // Directives are recognized only before a document has content. A '%' line
         // after content is a plain scalar ("scalar\n%YAML 1.2").
@@ -135,6 +145,7 @@ pub fn scan(self: *Scanner) !ScannedDocument {
         }
 
         if (pending_directive) return Error.Parse.UnexpectedToken;
+        try rejectBadTag(content);
 
         emitted_in_doc = true;
         open_explicit = false;
@@ -144,7 +155,7 @@ pub fn scan(self: *Scanner) !ScannedDocument {
                 ""
             else
                 stripInlineComment(std.mem.trimStart(u8, content[2..], " \t"));
-            const sequence_value = try joinUnclosedFlow(self.allocator, physical.items, &line_no, sequence_raw, &owned);
+            const sequence_value = try joinUnclosedFlow(self.allocator, physical.items, &line_no, sequence_raw, &owned, indent, false);
             const sequence_style = detectStyle(sequence_value);
             try ensureBlockHeader(sequence_style, sequence_value);
             try self.lines.append(self.allocator, .{
@@ -155,6 +166,7 @@ pub fn scan(self: *Scanner) !ScannedDocument {
                 .style = sequence_style,
                 .span = makeSpan(line_no, indent, line.len),
             });
+            self.stampComment(&comment_pending, line_ends_with_comment);
             continue;
         }
 
@@ -178,6 +190,7 @@ pub fn scan(self: *Scanner) !ScannedDocument {
                 .span = makeSpan(line_no, indent, line.len),
                 .explicit_key = true,
             });
+            self.stampComment(&comment_pending, line_ends_with_comment);
             continue;
         }
 
@@ -187,7 +200,7 @@ pub fn scan(self: *Scanner) !ScannedDocument {
                 ""
             else
                 stripInlineComment(std.mem.trimStart(u8, content[2..], " \t"));
-            const value = try joinUnclosedFlow(self.allocator, physical.items, &line_no, raw_value, &owned);
+            const value = try joinUnclosedFlow(self.allocator, physical.items, &line_no, raw_value, &owned, indent, false);
             const value_style = detectStyle(value);
             try ensureBlockHeader(value_style, value);
             try self.lines.append(self.allocator, .{
@@ -198,6 +211,7 @@ pub fn scan(self: *Scanner) !ScannedDocument {
                 .style = value_style,
                 .span = makeSpan(line_no, indent, line.len),
             });
+            self.stampComment(&comment_pending, line_ends_with_comment);
             continue;
         }
 
@@ -205,7 +219,7 @@ pub fn scan(self: *Scanner) !ScannedDocument {
             const key = std.mem.trim(u8, content[0..idx], " \t");
             if (key.len == 0) return Error.Parse.InvalidMappingKey;
             const raw_value = stripInlineComment(std.mem.trimStart(u8, content[idx + 1 ..], " \t"));
-            const value = try joinUnclosedFlow(self.allocator, physical.items, &line_no, raw_value, &owned);
+            const value = try joinUnclosedFlow(self.allocator, physical.items, &line_no, raw_value, &owned, indent, false);
             const value_style = detectStyle(value);
             const key_style = detectStyle(key);
             try ensureBlockHeader(key_style, key);
@@ -224,10 +238,12 @@ pub fn scan(self: *Scanner) !ScannedDocument {
                 .style = value_style,
                 .span = makeSpan(line_no, indent, line.len),
             });
+            self.stampComment(&comment_pending, line_ends_with_comment);
             continue;
         }
 
-        const scalar_value = try joinUnclosedFlow(self.allocator, physical.items, &line_no, content, &owned);
+        const flow_opens_line = !from_marker and content.len > 0 and (content[0] == '[' or content[0] == '{');
+        const scalar_value = try joinUnclosedFlow(self.allocator, physical.items, &line_no, content, &owned, indent, flow_opens_line);
         const scalar_style = detectStyle(scalar_value);
         try ensureBlockHeader(scalar_style, scalar_value);
         try self.lines.append(self.allocator, .{
@@ -238,6 +254,7 @@ pub fn scan(self: *Scanner) !ScannedDocument {
             .style = scalar_style,
             .span = makeSpan(line_no, indent, line.len),
         });
+        self.stampComment(&comment_pending, line_ends_with_comment);
     }
 
     if (pending_directive) return Error.Parse.UnexpectedToken;
@@ -476,6 +493,29 @@ fn appendMarker(self: *Scanner, kind: LineKind, line_no: usize) !void {
         .indent = 0,
         .kind = kind,
     });
+}
+
+fn rejectBadTag(text: []const u8) !void {
+    // A plain scalar of symbols (`!"#$...{|}~`) is not a tag. Tags that contain
+    // `{}[],` are followed by whitespace and a separate token.
+    if (std.mem.indexOfAny(u8, text, " \t") == null) return;
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        const at_tag = text[i] == '!' and (i == 0 or text[i - 1] == ' ' or text[i - 1] == '\t');
+        if (!at_tag) continue;
+        i += 1;
+        if (i < text.len and text[i] == '<') {
+            while (i < text.len and text[i] != '>') : (i += 1) {}
+            continue;
+        }
+        if (i < text.len and text[i] == '!') i += 1;
+        while (i < text.len and text[i] != ' ' and text[i] != '\t') : (i += 1) {
+            switch (text[i]) {
+                '{', '}', '[', ']', ',' => return Error.Parse.UnexpectedToken,
+                else => {},
+            }
+        }
+    }
 }
 
 fn isDocumentMarker(content: []const u8, marker: []const u8) bool {
@@ -722,12 +762,25 @@ fn flowUnclosed(text: []const u8) bool {
 
 /// Pull following physical lines into `initial` until flow brackets and quotes balance.
 /// `index` is updated to the last consumed line.
+fn stampComment(self: *Scanner, comment_pending: *bool, ends_with_comment: bool) void {
+    const line = &self.lines.items[self.lines.items.len - 1];
+    line.after_comment = comment_pending.*;
+    line.ends_with_comment = ends_with_comment;
+    comment_pending.* = false;
+}
+
+fn hasInlineComment(text: []const u8) bool {
+    return stripInlineComment(text).len != text.len;
+}
+
 fn joinUnclosedFlow(
     allocator: std.mem.Allocator,
     lines: []const []const u8,
     index: *usize,
     initial: []const u8,
     owned: *std.ArrayListUnmanaged([]u8),
+    parent_indent: usize,
+    opener_at_line_start: bool,
 ) ![]const u8 {
     if (!flowUnclosed(initial)) return initial;
 
@@ -735,10 +788,22 @@ fn joinUnclosedFlow(
     errdefer buf.deinit(allocator);
     try buf.appendSlice(allocator, initial);
 
+    // Only a value that itself opens a flow collection is indentation-sensitive
+    // (`flow: [a,\nb]`). A `{` inside later plain or block text is not a flow node.
+    const trimmed_initial = std.mem.trimStart(u8, initial, " \t");
+    const enforce_indent = trimmed_initial.len > 0 and (trimmed_initial[0] == '[' or trimmed_initial[0] == '{');
+    // A flow node nested in a block value cannot continue at the parent's column.
+    // A flow node that opens the line can (`[\nfoo: bar\n]`).
+    const min_indent = if (opener_at_line_start) parent_indent else parent_indent + 1;
+
     var i = index.* + 1;
     while (i < lines.len and flowUnclosed(buf.items)) : (i += 1) {
+        const cont = lines[i];
+        if (enforce_indent and std.mem.trim(u8, cont, " \t").len != 0 and countIndent(cont) < min_indent) {
+            return Error.Parse.InvalidIndentation;
+        }
         try buf.append(allocator, '\n');
-        try buf.appendSlice(allocator, lines[i]);
+        try buf.appendSlice(allocator, cont);
     }
     if (i == index.* + 1) return initial;
 
@@ -857,9 +922,13 @@ fn plainFlowLexeme(
     raw: []const u8,
     folded: *std.ArrayListUnmanaged([]u8),
 ) ![]const u8 {
-    if (std.mem.indexOfAny(u8, raw, "\n\r") == null) return std.mem.trim(u8, raw, " \t");
-    const folded_text = try foldFlowQuoted(allocator, raw, folded);
-    return std.mem.trim(u8, folded_text, " \t");
+    const lexeme = if (std.mem.indexOfAny(u8, raw, "\n\r") == null)
+        std.mem.trim(u8, raw, " \t")
+    else
+        std.mem.trim(u8, try foldFlowQuoted(allocator, raw, folded), " \t");
+    // A bare dash inside a flow collection is not a plain scalar (`[-]`, `[-, -]`).
+    if (std.mem.eql(u8, lexeme, "-")) return Error.Parse.UnexpectedToken;
+    return lexeme;
 }
 
 fn isFlowValueColon(text: []const u8, idx: usize) bool {
