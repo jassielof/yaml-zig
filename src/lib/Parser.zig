@@ -49,6 +49,7 @@ pub fn parse(self: *Parser) ![]EventModel.Event {
         try self.pushScalar("null", .plain, null, .{});
     } else {
         try self.parseBlockValue(self.scanned.lines.items[0].indent, true);
+        if (self.index < self.scanned.lines.items.len) return Error.Parse.UnexpectedToken;
     }
 
     try self.pushSimple(.document_end, .{});
@@ -935,14 +936,10 @@ fn parseScalarLikeValue(
 
     if (working_style == .plain and working[0] == '*') {
         var end: usize = 1;
-        while (end < working.len) : (end += 1) {
-            const c = working[end];
-            // Stop at ":" when it's the key-value separator (followed by space or end)
-            if (c == ':' and (end + 1 >= working.len or working[end + 1] == ' ' or working[end + 1] == '\t')) break;
-            if (!Scanner.isBlockAnchorChar(c)) break;
-        }
+        while (end < working.len and Scanner.isBlockAnchorChar(working[end])) : (end += 1) {}
         const alias_name = working[1..end];
-        if (alias_name.len == 0) return Error.Parse.InvalidAlias;
+        const rest = std.mem.trim(u8, working[end..], " \t");
+        if (alias_name.len == 0 or rest.len != 0) return Error.Parse.InvalidAlias;
         try self.events.append(self.allocator, .{
             .kind = .alias,
             .data = .{ .alias = .{ .name = try self.allocator.dupe(u8, alias_name), .span = .{} } },
@@ -999,7 +996,12 @@ fn detectInlineStyle(value: []const u8) Token.ScalarStyle {
 }
 
 fn parseFlow(self: *Parser, text: []const u8, line_no: usize, col: usize) anyerror!void {
-    const tokens = try Scanner.tokenizeFlow(self.allocator, text, line_no, col);
+    var folded: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (folded.items) |buf| self.allocator.free(buf);
+        folded.deinit(self.allocator);
+    }
+    const tokens = try Scanner.tokenizeFlow(self.allocator, text, line_no, col, &folded);
     defer self.allocator.free(tokens);
     var cursor: usize = 0;
     try self.parseFlowValue(tokens, &cursor);
@@ -1135,7 +1137,7 @@ fn normalizeScalar(allocator: std.mem.Allocator, raw: []const u8, style: Token.S
             }
             return out.toOwnedSlice(allocator);
         },
-        else => return allocator.dupe(u8, raw),
+        else => return allocator.dupe(u8, std.mem.trim(u8, raw, " \t")),
     }
 }
 
@@ -1185,12 +1187,10 @@ fn stripAnchorPrefix(raw: []const u8) []const u8 {
     while (value.len > 1 and value[0] == '&') {
         var i: usize = 1;
         while (i < value.len) : (i += 1) {
-            const c = value[i];
-            if (c == ':' and (i + 1 >= value.len or value[i + 1] == ' ' or value[i + 1] == '\t')) break;
-            if (!Scanner.isBlockAnchorChar(c)) break;
+            if (!Scanner.isBlockAnchorChar(value[i])) break;
         }
         if (i <= 1) break;
-        value = std.mem.trimStart(u8, value[i..], " :\t");
+        value = std.mem.trimStart(u8, value[i..], " \t");
     }
     return value;
 }
@@ -1201,16 +1201,12 @@ fn extractLeadingAnchor(raw: []const u8) struct { name: []const u8, rest: []cons
 
     var i: usize = 1;
     while (i < value.len) : (i += 1) {
-        const c = value[i];
-        // Stop before ":" when it's the key-value separator (e.g. "&x: value" -> name "x")
-        if (c == ':' and (i + 1 >= value.len or value[i + 1] == ' ' or value[i + 1] == '\t')) break;
-        if (!Scanner.isBlockAnchorChar(c)) break;
+        if (!Scanner.isBlockAnchorChar(value[i])) break;
     }
     if (i <= 1) return .{ .name = "", .rest = raw };
 
     const name = value[1..i];
-    // Strip optional ": " after anchor (e.g. "&a: key" -> key)
-    value = std.mem.trimStart(u8, value[i..], " :\t");
+    value = std.mem.trimStart(u8, value[i..], " \t");
     return .{ .name = name, .rest = value };
 }
 
@@ -1417,30 +1413,21 @@ fn countSpaces(line: []const u8) usize {
     return i;
 }
 
-fn looksLikeStructure(content: []const u8) bool {
-    if (content.len == 0) return false;
-    if (content[0] == '-' and (content.len == 1 or content[1] == ' ' or content[1] == '\t')) return true;
-    if (content[0] == '?' and (content.len == 1 or content[1] == ' ' or content[1] == '\t')) return true;
-    if (findMappingColonForStructureCheck(content)) return true;
-    return false;
-}
-
-fn findMappingColonForStructureCheck(text: []const u8) bool {
-    for (text, 0..) |c, idx| {
-        if (c == ':' and (idx + 1 >= text.len or text[idx + 1] == ' ' or text[idx + 1] == '\t')) {
-            return true;
-        }
-    }
-    return false;
-}
-
 fn stripCR(line: []const u8) []const u8 {
     if (line.len > 0 and line[line.len - 1] == '\r') return line[0 .. line.len - 1];
     return line;
 }
 
+fn looksLikeStructure(content: []const u8) bool {
+    if (content.len == 0) return false;
+    if (content[0] == '-' and (content.len == 1 or content[1] == ' ' or content[1] == '\t')) return true;
+    if (content[0] == '?' and (content.len == 1 or content[1] == ' ' or content[1] == '\t')) return true;
+    if (Scanner.findInlineMappingColon(content) != null) return true;
+    return false;
+}
+
 fn isAliasToken(raw: []const u8) ?[]const u8 {
-    const value = std.mem.trim(u8, raw, " ");
+    const value = std.mem.trim(u8, raw, " \t");
     if (value.len <= 1 or value[0] != '*') return null;
     var end: usize = 1;
     while (end < value.len and Scanner.isBlockAnchorChar(value[end])) : (end += 1) {}
