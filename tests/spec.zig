@@ -16,6 +16,7 @@ const FixtureOutcome = struct {
 };
 
 const CoverageReport = struct {
+    backend: []const u8,
     total: usize,
     passed: usize,
     unsupported: usize,
@@ -24,6 +25,19 @@ const CoverageReport = struct {
     passed_ids: []const []const u8,
     unsupported_ids: []const []const u8,
     failed_ids: []const []const u8,
+    failures: []const FailureDetail,
+    unsupported_groups: []const ReasonGroup,
+};
+
+const FailureDetail = struct {
+    id: []const u8,
+    detail: []const u8,
+};
+
+const ReasonGroup = struct {
+    reason: []const u8,
+    count: usize,
+    ids: []const []const u8,
 };
 
 test "yaml-test-suite coverage across all fixture cases" {
@@ -71,7 +85,26 @@ fn runSpecCoverage(backend: Backend) !void {
     const failed = failed_ids.items.len;
     const coverage_percent = if (total == 0) 0.0 else (@as(f64, @floatFromInt(passed)) * 100.0) / @as(f64, @floatFromInt(total));
 
+    var groups = try collectReasonGroups(testing.allocator, outcomes.items);
+    defer {
+        for (groups.items) |group| testing.allocator.free(group.ids);
+        groups.deinit(testing.allocator);
+    }
+
+    var failure_details: std.ArrayListUnmanaged(FailureDetail) = .empty;
+    defer {
+        for (failure_details.items) |detail| testing.allocator.free(detail.detail);
+        failure_details.deinit(testing.allocator);
+    }
+    for (outcomes.items) |outcome| {
+        if (outcome.class != .fail) continue;
+        const diag = diagnoseFixture(backend, outcome.id);
+        const detail = if (diag.allocated) diag.text else try testing.allocator.dupe(u8, diag.text);
+        try failure_details.append(testing.allocator, .{ .id = outcome.id, .detail = detail });
+    }
+
     try writeCoverageJson(backend, .{
+        .backend = backendName(backend),
         .total = total,
         .passed = passed,
         .unsupported = unsupported,
@@ -80,16 +113,11 @@ fn runSpecCoverage(backend: Backend) !void {
         .passed_ids = passed_ids.items,
         .unsupported_ids = unsupported_ids.items,
         .failed_ids = failed_ids.items,
+        .failures = failure_details.items,
+        .unsupported_groups = groups.items,
     });
 
-    std.debug.print(
-        "{s} spec summary: passed={d} unsupported={d} failed={d} total_discovered={d} coverage={d:.2}%\n",
-        .{ backendName(backend), passed, unsupported, failed, total, coverage_percent },
-    );
-
-    if (!summary_only) {
-        printVerboseReport(backend, outcomes.items);
-    }
+    printCoverageSummary(backend, total, passed, failed, unsupported, coverage_percent, failure_details.items, groups.items, summary_only);
 
     try testing.expect(total > 0);
     if (backend == .fy) {
@@ -124,12 +152,18 @@ fn classifyFixture(backend: Backend, id: []const u8) FixtureOutcome {
         return .{ .id = owned_id, .class = .unsupported, .err_name = "FileAccessError" };
     if (!has_yaml) return .{ .id = owned_id, .class = .unsupported, .err_name = "no in.yaml" };
 
-    const has_expected = pathExists(switch (backend) {
-        .yaml => in_json_path,
-        .fy => if ((pathExists(error_path) catch false)) in_yaml_path else test_event_path,
-    }) catch
+    const has_error = pathExists(error_path) catch
         return .{ .id = owned_id, .class = .unsupported, .err_name = "FileAccessError" };
-    if (!has_expected) return .{ .id = owned_id, .class = .unsupported, .err_name = if (backend == .yaml) "no in.json" else "no test.event" };
+    const has_json = pathExists(in_json_path) catch
+        return .{ .id = owned_id, .class = .unsupported, .err_name = "FileAccessError" };
+    const has_events = pathExists(test_event_path) catch
+        return .{ .id = owned_id, .class = .unsupported, .err_name = "FileAccessError" };
+
+    const has_expected = switch (backend) {
+        .yaml => has_error or has_json,
+        .fy => if (has_error) true else has_events,
+    };
+    if (!has_expected) return .{ .id = owned_id, .class = .unsupported, .err_name = if (backend == .yaml) "no oracle" else "no test.event" };
 
     runFixtureSemanticCheck(backend, id) catch |err| {
         const tag = @errorName(err);
@@ -164,6 +198,14 @@ fn runFixtureSemanticCheck(backend: Backend, id: []const u8) !void {
 
     switch (backend) {
         .yaml => {
+            const error_path = try std.fmt.allocPrint(testing.allocator, "tests/fixtures/{s}/error", .{id});
+            defer testing.allocator.free(error_path);
+            if (try pathExists(error_path)) {
+                var document = yaml.parseDocument(testing.allocator, in_yaml, .{}) catch return;
+                document.deinit();
+                return error.TestUnexpectedResult;
+            }
+
             const in_json_path = try std.fmt.allocPrint(testing.allocator, "tests/fixtures/{s}/in.json", .{id});
             defer testing.allocator.free(in_json_path);
             const in_json = try readFileAlloc(testing.allocator, in_json_path);
@@ -207,64 +249,97 @@ fn runFixtureSemanticCheck(backend: Backend, id: []const u8) !void {
     }
 }
 
-// Verbose report
+fn printCoverageSummary(
+    backend: Backend,
+    total: usize,
+    passed: usize,
+    failed: usize,
+    unsupported: usize,
+    coverage_percent: f64,
+    failures: []const FailureDetail,
+    groups: []const ReasonGroup,
+    summary_only: bool,
+) void {
+    var bar: [24]u8 = undefined;
+    std.debug.print("\n{s} spec summary\n", .{backendName(backend)});
+    std.debug.print("  {s}  {d:.2}%\n", .{ coverageBar(passed, total, &bar), coverage_percent });
+    std.debug.print("  passed {d:>4}   failed {d:>4}   unsupported {d:>4}   discovered {d}\n", .{
+        passed, failed, unsupported, total,
+    });
 
-fn printVerboseReport(backend: Backend, outcomes: []const FixtureOutcome) void {
-    std.debug.print("\n", .{});
-
-    // Failures with diagnostics
-    var fail_count: usize = 0;
-    for (outcomes) |o| {
-        if (o.class == .fail) fail_count += 1;
-    }
-    if (fail_count > 0) {
-        std.debug.print("FAIL ({d}):\n", .{fail_count});
-        for (outcomes) |o| {
-            if (o.class != .fail) continue;
-            const diag = diagnoseFixture(backend, o.id);
-            defer if (diag.allocated) testing.allocator.free(diag.text);
-            std.debug.print("  {s:<16} {s}\n", .{ o.id, diag.text });
+    if (failures.len > 0) {
+        std.debug.print("  failures\n", .{});
+        for (failures) |failure| {
+            std.debug.print("    {s:<16} {s}\n", .{ failure.id, failure.detail });
         }
-        std.debug.print("\n", .{});
     }
 
-    // Unsupported grouped by error type
-    var unsup_count: usize = 0;
-    for (outcomes) |o| {
-        if (o.class == .unsupported) unsup_count += 1;
-    }
-    if (unsup_count > 0) {
-        std.debug.print("UNSUPPORTED ({d}):\n", .{unsup_count});
-
-        var groups = std.StringHashMap(std.ArrayListUnmanaged([]const u8)).init(testing.allocator);
-        defer {
-            var it = groups.valueIterator();
-            while (it.next()) |list| list.deinit(testing.allocator);
-            groups.deinit();
-        }
-
-        for (outcomes) |o| {
-            if (o.class != .unsupported) continue;
-            const result = groups.getOrPut(o.err_name) catch continue;
-            if (!result.found_existing) result.value_ptr.* = .empty;
-            result.value_ptr.append(testing.allocator, o.id) catch continue;
-        }
-
-        var git = groups.iterator();
-        while (git.next()) |entry| {
-            const ids = entry.value_ptr.items;
-            std.debug.print("  {s:<28} ({d})", .{ entry.key_ptr.*, ids.len });
-            if (ids.len <= 8) {
+    if (groups.len > 0) {
+        std.debug.print("  unsupported\n", .{});
+        for (groups) |group| {
+            std.debug.print("    {s:<24} {d:>4}", .{ group.reason, group.count });
+            if (!summary_only and group.ids.len <= 8) {
                 std.debug.print("  ", .{});
-                for (ids, 0..) |fid, i| {
+                for (group.ids, 0..) |id, i| {
                     if (i > 0) std.debug.print(", ", .{});
-                    std.debug.print("{s}", .{fid});
+                    std.debug.print("{s}", .{id});
                 }
             }
             std.debug.print("\n", .{});
         }
-        std.debug.print("\n", .{});
     }
+}
+
+fn coverageBar(passed: usize, total: usize, bar: *[24]u8) []const u8 {
+    @memset(bar, '-');
+    if (total == 0) return bar;
+    const filled = (passed * bar.len) / total;
+    @memset(bar[0..filled], '#');
+    return bar;
+}
+
+fn collectReasonGroups(
+    allocator: std.mem.Allocator,
+    outcomes: []const FixtureOutcome,
+) !std.ArrayListUnmanaged(ReasonGroup) {
+    var map: std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)) = .empty;
+    defer {
+        var it = map.valueIterator();
+        while (it.next()) |list| list.deinit(allocator);
+        map.deinit(allocator);
+    }
+
+    for (outcomes) |outcome| {
+        if (outcome.class != .unsupported) continue;
+        const result = try map.getOrPut(allocator, outcome.err_name);
+        if (!result.found_existing) result.value_ptr.* = .empty;
+        try result.value_ptr.append(allocator, outcome.id);
+    }
+
+    var groups: std.ArrayListUnmanaged(ReasonGroup) = .empty;
+    errdefer {
+        for (groups.items) |group| allocator.free(group.ids);
+        groups.deinit(allocator);
+    }
+
+    var it = map.iterator();
+    while (it.next()) |entry| {
+        const ids = try allocator.dupe([]const u8, entry.value_ptr.items);
+        try groups.append(allocator, .{
+            .reason = entry.key_ptr.*,
+            .count = ids.len,
+            .ids = ids,
+        });
+    }
+
+    std.sort.heap(ReasonGroup, groups.items, {}, struct {
+        fn less(_: void, lhs: ReasonGroup, rhs: ReasonGroup) bool {
+            if (lhs.count != rhs.count) return lhs.count > rhs.count;
+            return std.mem.lessThan(u8, lhs.reason, rhs.reason);
+        }
+    }.less);
+
+    return groups;
 }
 
 const DiagResult = struct { text: []const u8, allocated: bool };
@@ -279,6 +354,16 @@ fn diagnoseFixture(backend: Backend, id: []const u8) DiagResult {
 
     switch (backend) {
         .yaml => {
+            const error_path = std.fmt.allocPrint(testing.allocator, "tests/fixtures/{s}/error", .{id}) catch
+                return .{ .text = "?", .allocated = false };
+            defer testing.allocator.free(error_path);
+            if (pathExists(error_path) catch false) {
+                var document = yaml.parseDocument(testing.allocator, yaml_src, .{}) catch
+                    return .{ .text = "rejected invalid input", .allocated = false };
+                document.deinit();
+                return .{ .text = "accepted a document the suite marks invalid", .allocated = false };
+            }
+
             const json_path = std.fmt.allocPrint(testing.allocator, "tests/fixtures/{s}/in.json", .{id}) catch
                 return .{ .text = "?", .allocated = false };
             defer testing.allocator.free(json_path);

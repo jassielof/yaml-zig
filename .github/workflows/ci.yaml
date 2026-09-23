@@ -37,7 +37,7 @@ jobs:
         uses: actions/upload-pages-artifact@v5
         with:
           path: zig-out/docs
-  tests:
+  test:
     strategy:
       fail-fast: false
       matrix:
@@ -56,8 +56,8 @@ jobs:
       - name: Setup Zig
         uses: jassielof/setup-zig@main
 
-      - name: Tests
-        run: zig build --summary all tests -Dsummary=true
+      - name: Test
+        run: zig build --summary all test -Dsummary=true
 
       - name: Setup Python
         if: always()
@@ -78,7 +78,7 @@ jobs:
     runs-on: ubuntu-latest
     name: Deploy to GitHub Pages
     if: github.event_name != 'pull_request'
-    needs: tests
+    needs: test
     steps:
       - name: Deploy to GitHub Pages
         id: deployment

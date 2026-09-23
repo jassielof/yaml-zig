@@ -60,7 +60,7 @@ pub fn build(b: *std.Build) void {
     const build_options = b.addOptions();
     build_options.addOption(bool, "summary_only", summary_only);
 
-    const tests_step = b.step("tests", "Run the test suite");
+    const test_step = b.step("test", "Run the test suite");
 
     const integration_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -79,12 +79,12 @@ pub fn build(b: *std.Build) void {
     fy_dep.link(integration_tests.root_module);
 
     const run_integration_tests = b.addRunArtifact(integration_tests);
-    tests_step.dependOn(&run_integration_tests.step);
+    test_step.dependOn(&run_integration_tests.step);
 
     // const unit_tests = b.addTest(.{
     //     .root_module = lib_mod,
     // });
 
     // const run_unit_tests = b.addRunArtifact(unit_tests);
-    // tests_step.dependOn(&run_unit_tests.step);
+    // test_step.dependOn(&run_unit_tests.step);
 }
