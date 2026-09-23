@@ -201,8 +201,11 @@ fn runFixtureSemanticCheck(backend: Backend, id: []const u8) !void {
             const error_path = try std.fmt.allocPrint(testing.allocator, "tests/fixtures/{s}/error", .{id});
             defer testing.allocator.free(error_path);
             if (try pathExists(error_path)) {
-                var document = yaml.parseDocument(testing.allocator, in_yaml, .{}) catch return;
-                document.deinit();
+                const documents = yaml.parseStream(testing.allocator, in_yaml, .{}) catch return;
+                defer {
+                    for (documents) |*document| document.deinit();
+                    testing.allocator.free(documents);
+                }
                 return error.TestUnexpectedResult;
             }
 
@@ -211,13 +214,22 @@ fn runFixtureSemanticCheck(backend: Backend, id: []const u8) !void {
             const in_json = try readFileAlloc(testing.allocator, in_json_path);
             defer testing.allocator.free(in_json);
 
-            var doc = try yaml.parseDocument(testing.allocator, in_yaml, .{});
-            defer doc.deinit();
+            const docs = try yaml.parseStream(testing.allocator, in_yaml, .{});
+            defer {
+                for (docs) |*doc| doc.deinit();
+                testing.allocator.free(docs);
+            }
 
-            var parsed_json = try std.json.parseFromSlice(std.json.Value, testing.allocator, in_json, .{});
-            defer parsed_json.deinit();
+            var parsed_json = try parseJsonValues(testing.allocator, in_json);
+            defer {
+                for (parsed_json.items) |*parsed| parsed.deinit();
+                parsed_json.deinit(testing.allocator);
+            }
 
-            try expectNodeMatchesJson(&doc.root, parsed_json.value);
+            if (docs.len != parsed_json.items.len) return error.TestUnexpectedResult;
+            for (docs, parsed_json.items) |*doc, parsed| {
+                try expectNodeMatchesJson(&doc.root, parsed.value);
+            }
         },
         .fy => {
             const error_path = try std.fmt.allocPrint(testing.allocator, "tests/fixtures/{s}/error", .{id});
@@ -358,9 +370,12 @@ fn diagnoseFixture(backend: Backend, id: []const u8) DiagResult {
                 return .{ .text = "?", .allocated = false };
             defer testing.allocator.free(error_path);
             if (pathExists(error_path) catch false) {
-                var document = yaml.parseDocument(testing.allocator, yaml_src, .{}) catch
+                const documents = yaml.parseStream(testing.allocator, yaml_src, .{}) catch
                     return .{ .text = "rejected invalid input", .allocated = false };
-                document.deinit();
+                defer {
+                    for (documents) |*document| document.deinit();
+                    testing.allocator.free(documents);
+                }
                 return .{ .text = "accepted a document the suite marks invalid", .allocated = false };
             }
 
@@ -370,15 +385,30 @@ fn diagnoseFixture(backend: Backend, id: []const u8) DiagResult {
             const json_src = readFileAlloc(testing.allocator, json_path) catch return .{ .text = "cannot read json", .allocated = false };
             defer testing.allocator.free(json_src);
 
-            var doc = yaml.parseDocument(testing.allocator, yaml_src, .{}) catch |e|
+            const docs = yaml.parseStream(testing.allocator, yaml_src, .{}) catch |e|
                 return .{ .text = @errorName(e), .allocated = false };
-            defer doc.deinit();
+            defer {
+                for (docs) |*doc| doc.deinit();
+                testing.allocator.free(docs);
+            }
 
-            var parsed = std.json.parseFromSlice(std.json.Value, testing.allocator, json_src, .{}) catch
+            var parsed = parseJsonValues(testing.allocator, json_src) catch
                 return .{ .text = "invalid expected json", .allocated = false };
-            defer parsed.deinit();
+            defer {
+                for (parsed.items) |*item| item.deinit();
+                parsed.deinit(testing.allocator);
+            }
 
-            return describeMismatch(&doc.root, parsed.value);
+            if (docs.len != parsed.items.len) {
+                const text = std.fmt.allocPrint(testing.allocator, "expected {d} documents, got {d}", .{ parsed.items.len, docs.len }) catch
+                    return .{ .text = "document count mismatch", .allocated = false };
+                return .{ .text = text, .allocated = true };
+            }
+            for (docs, parsed.items) |*doc, item| {
+                const mismatch = describeMismatch(&doc.root, item.value);
+                if (!std.mem.eql(u8, mismatch.text, "ok")) return mismatch;
+            }
+            return .{ .text = "ok", .allocated = false };
         },
         .fy => {
             const error_path = std.fmt.allocPrint(testing.allocator, "tests/fixtures/{s}/error", .{id}) catch
@@ -884,6 +914,90 @@ fn stripCarriageReturnsAlloc(allocator: std.mem.Allocator, input: []const u8) ![
     }
 
     return output.toOwnedSlice(allocator);
+}
+
+fn parseJsonValues(allocator: std.mem.Allocator, src: []const u8) !std.ArrayListUnmanaged(std.json.Parsed(std.json.Value)) {
+    var values: std.ArrayListUnmanaged(std.json.Parsed(std.json.Value)) = .empty;
+    errdefer {
+        for (values.items) |*parsed| parsed.deinit();
+        values.deinit(allocator);
+    }
+
+    var i: usize = 0;
+    while (i < src.len) {
+        while (i < src.len and (src[i] == ' ' or src[i] == '\t' or src[i] == '\n' or src[i] == '\r')) : (i += 1) {}
+        if (i >= src.len) break;
+        const end = try jsonValueEnd(src, i);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, src[i..end], .{});
+        try values.append(allocator, parsed);
+        i = end;
+    }
+    return values;
+}
+
+fn jsonValueEnd(src: []const u8, start: usize) !usize {
+    if (start >= src.len) return error.SyntaxError;
+    switch (src[start]) {
+        '"' => {
+            var i = start + 1;
+            var escaped = false;
+            while (i < src.len) : (i += 1) {
+                if (escaped) {
+                    escaped = false;
+                    continue;
+                }
+                if (src[i] == '\\') {
+                    escaped = true;
+                    continue;
+                }
+                if (src[i] == '"') return i + 1;
+            }
+            return error.SyntaxError;
+        },
+        '{', '[' => {
+            var depth: usize = 0;
+            var in_string = false;
+            var escaped = false;
+            var i = start;
+            while (i < src.len) : (i += 1) {
+                const ch = src[i];
+                if (in_string) {
+                    if (escaped) {
+                        escaped = false;
+                        continue;
+                    }
+                    if (ch == '\\') {
+                        escaped = true;
+                        continue;
+                    }
+                    if (ch == '"') in_string = false;
+                    continue;
+                }
+                switch (ch) {
+                    '"' => in_string = true,
+                    '{', '[' => depth += 1,
+                    '}', ']' => {
+                        if (depth == 0) return error.SyntaxError;
+                        depth -= 1;
+                        if (depth == 0) return i + 1;
+                    },
+                    else => {},
+                }
+            }
+            return error.SyntaxError;
+        },
+        else => {
+            var i = start;
+            while (i < src.len) : (i += 1) {
+                switch (src[i]) {
+                    ' ', '\t', '\n', '\r' => break,
+                    else => {},
+                }
+            }
+            if (i == start) return error.SyntaxError;
+            return i;
+        },
+    }
 }
 
 fn expectNodeMatchesJson(node: *const yaml.Node.Node, value: std.json.Value) !void {
