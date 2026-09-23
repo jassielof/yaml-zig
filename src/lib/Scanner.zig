@@ -91,6 +91,8 @@ pub fn scan(self: *Scanner) !ScannedDocument {
     var pending_directive = false;
     var yaml_directive_count: usize = 0;
     var comment_pending = false;
+    var saw_tag_directive = false;
+    var doc_has_tag_directive = false;
 
     while (line_no < physical.items.len) : (line_no += 1) {
         const line = physical.items[line_no];
@@ -108,6 +110,7 @@ pub fn scan(self: *Scanner) !ScannedDocument {
         if (content[0] == '%' and !emitted_in_doc) {
             if (open_explicit) return Error.Parse.UnexpectedToken;
             try validateDirective(content, &yaml_directive_count);
+            if (std.mem.startsWith(u8, content, "%TAG")) saw_tag_directive = true;
             pending_directive = true;
             continue;
         }
@@ -125,6 +128,8 @@ pub fn scan(self: *Scanner) !ScannedDocument {
             open_explicit = true;
             pending_directive = false;
             yaml_directive_count = 0;
+            doc_has_tag_directive = saw_tag_directive;
+            saw_tag_directive = false;
             if (rest.len == 0) continue;
             content = rest;
             from_marker = true;
@@ -141,11 +146,20 @@ pub fn scan(self: *Scanner) !ScannedDocument {
             }
             open_explicit = false;
             pending_directive = false;
+            doc_has_tag_directive = false;
             continue;
         }
 
         if (pending_directive) return Error.Parse.UnexpectedToken;
         try rejectBadTag(content);
+        // A `---` line already consumed the %TAG flag. Do not clear it on the
+        // first content line of that explicit document.
+        if (!from_marker and !emitted_in_doc and !open_explicit) {
+            doc_has_tag_directive = saw_tag_directive;
+            saw_tag_directive = false;
+        }
+        if (!doc_has_tag_directive and hasNamedTagHandle(content)) return Error.Parse.UnexpectedToken;
+        if (hasTabbedBlockIndicator(line)) return Error.Parse.InvalidIndentation;
         // A block mapping cannot share the document-start line (`--- a: b`).
         if (from_marker and findMappingColon(content) != null) return Error.Parse.UnexpectedToken;
         // `&anchor - item` is not a sequence; the dash must start the line.
@@ -246,7 +260,8 @@ pub fn scan(self: *Scanner) !ScannedDocument {
             continue;
         }
 
-        const flow_opens_line = !from_marker and content.len > 0 and (content[0] == '[' or content[0] == '{');
+        const flow_head = std.mem.trimStart(u8, content, " \t");
+        const flow_opens_line = !from_marker and flow_head.len > 0 and (flow_head[0] == '[' or flow_head[0] == '{');
         const scalar_value = try joinUnclosedFlow(self.allocator, physical.items, &line_no, content, &owned, indent, flow_opens_line);
         const scalar_style = detectStyle(scalar_value);
         try ensureBlockHeader(scalar_style, scalar_value);
@@ -497,6 +512,63 @@ fn appendMarker(self: *Scanner, kind: LineKind, line_no: usize) !void {
         .indent = 0,
         .kind = kind,
     });
+}
+
+fn tabBeforeColumn(line: []const u8, column: usize) bool {
+    var i: usize = 0;
+    while (i < line.len and i < column) : (i += 1) {
+        if (line[i] == '\t') return true;
+        if (line[i] != ' ') return false;
+    }
+    return false;
+}
+
+fn hasNamedTagHandle(text: []const u8) bool {
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        if (text[i] != '!') continue;
+        if (i > 0 and text[i - 1] != ' ' and text[i - 1] != '\t') continue;
+        if (i + 1 < text.len and (text[i + 1] == '!' or text[i + 1] == '<')) continue;
+        var j = i + 1;
+        while (j < text.len and isTagNameChar(text[j])) : (j += 1) {}
+        if (j > i + 1 and j < text.len and text[j] == '!') return true;
+    }
+    return false;
+}
+
+fn isTagNameChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '-';
+}
+
+/// A tab is separating block structure (`-\t-`, `\tb:`, `:\tkey:`). A tab before a
+/// plain scalar (`-\tbaz`, `-\t-1`) is separation, not indentation.
+fn hasTabbedBlockIndicator(line: []const u8) bool {
+    var i = countIndent(line);
+    var saw_tab = false;
+    while (i < line.len and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {
+        if (line[i] == '\t') saw_tab = true;
+    }
+    if (i >= line.len) return false;
+    if (saw_tab and isBlockStructureToken(line[i..])) return true;
+    if (line[i] != '-' and line[i] != '?' and line[i] != ':') return false;
+    if (line[i] != ':' and i + 1 < line.len and line[i + 1] != ' ' and line[i + 1] != '\t') return false;
+    var j = i + 1;
+    var sep_tab = false;
+    while (j < line.len and (line[j] == ' ' or line[j] == '\t')) : (j += 1) {
+        if (line[j] == '\t') sep_tab = true;
+    }
+    if (!sep_tab or j >= line.len) return false;
+    return isBlockStructureToken(line[j..]);
+}
+
+fn isBlockStructureToken(text: []const u8) bool {
+    if (text.len == 0) return false;
+    if ((text[0] == '-' or text[0] == '?' or text[0] == ':') and
+        (text.len == 1 or text[1] == ' ' or text[1] == '\t'))
+    {
+        return true;
+    }
+    return findMappingColon(text) != null;
 }
 
 fn anchorThenBlockEntry(text: []const u8) bool {
@@ -777,7 +849,7 @@ fn feedFlowBalance(balance: *FlowBalance, text: []const u8) void {
     }
 }
 
-fn flowUnclosed(text: []const u8) bool {
+pub fn flowUnclosed(text: []const u8) bool {
     var balance: FlowBalance = .{};
     feedFlowBalance(&balance, text);
     return balance.square > 0 or balance.curly > 0;
@@ -822,7 +894,11 @@ fn joinUnclosedFlow(
     var i = index.* + 1;
     while (i < lines.len and flowUnclosed(buf.items)) : (i += 1) {
         const cont = lines[i];
-        if (enforce_indent and std.mem.trim(u8, cont, " \t").len != 0 and countIndent(cont) < min_indent) {
+        const cont_text = std.mem.trim(u8, cont, " \t");
+        if (cont_text.len != 0 and (isDocumentMarker(cont_text, "---") or isDocumentMarker(cont_text, "..."))) {
+            return Error.Parse.UnexpectedToken;
+        }
+        if (enforce_indent and cont_text.len != 0 and (countIndent(cont) < min_indent or tabBeforeColumn(cont, min_indent))) {
             return Error.Parse.InvalidIndentation;
         }
         try buf.append(allocator, '\n');

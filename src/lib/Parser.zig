@@ -566,6 +566,10 @@ fn emitSingleMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_inden
                         try self.pushSimple(.mapping_end, .{});
                         return;
                     } else {
+                        if (next.kind == .scalar) {
+                            const nv = stripTagPrefix(std.mem.trim(u8, next.value, " "));
+                            if (extractLeadingAnchor(nv).name.len > 0) return Error.Parse.UnexpectedToken;
+                        }
                         try self.parseBlockValue(next.indent, false);
                     }
                 } else {
@@ -914,6 +918,8 @@ fn collectBlockScalar(
     var base_indent: ?usize = if (explicit_indent) |ei| parent_indent + ei else null;
     var block_end: usize = header_line_no + 1;
     var has_content = false;
+    var leading_spaces: usize = 0;
+    var in_leading = base_indent == null;
 
     {
         var ri = header_line_no + 1;
@@ -927,7 +933,12 @@ fn collectBlockScalar(
                 if (rline.len == 3 or rline[3] == ' ' or rline[3] == '\t') break;
             }
 
+            // A tab in the parent's column is indentation, which YAML forbids.
+            // A tab past that column is block-scalar content (` \t`, `  \t bar`).
+            if (tabAtOrBefore(rline, parent_indent)) return Error.Parse.InvalidIndentation;
+
             if (is_blank) {
+                if (in_leading and li > leading_spaces) leading_spaces = li;
                 block_end = ri + 1;
                 continue;
             }
@@ -935,7 +946,10 @@ fn collectBlockScalar(
             if (base_indent == null) {
                 if (li <= parent_indent and looksLikeStructure(rline[li..])) break;
                 if (li <= parent_indent and parent_indent > 0) break;
+                // Leading empty lines must not be indented past the first content line.
+                if (leading_spaces > li) return Error.Parse.InvalidIndentation;
                 base_indent = li;
+                in_leading = false;
             }
             if (li < base_indent.?) break;
 
@@ -1423,6 +1437,9 @@ fn collectPlainContinuation(self: *Parser, min_indent: usize, initial: []const u
     self.index += 1;
     // A trailing comment ends the plain scalar (`word1 # comment` / `word2`).
     if (start.ends_with_comment) return out.toOwnedSlice(self.allocator);
+    // A finished quoted or flow node does not continue onto the next line
+    // (`!foo "bar"` then `%TAG`).
+    if (isClosedNode(initial)) return out.toOwnedSlice(self.allocator);
 
     while (self.index < self.scanned.lines.items.len) {
         const line = self.scanned.lines.items[self.index];
@@ -1507,7 +1524,9 @@ fn collectMultilineQuotedValue(self: *Parser, base_indent: usize, initial: []con
     while (self.index < self.scanned.lines.items.len and !hasClosingQuote(out.items, quote)) {
         const line = self.scanned.lines.items[self.index];
         if (line.kind == .document_end or line.kind == .empty_document) break;
-        if (line.indent < base_indent) break;
+        // A mapping or sequence value must continue past the parent's column
+        // (`quoted: "a\nb\nc"`, `"bar\n\tbaz"`).
+        if (line.indent <= base_indent) return Error.Parse.InvalidIndentation;
 
         const gap = if (line.line_no > prev_line_no) line.line_no - prev_line_no - 1 else 0;
 
@@ -1609,6 +1628,25 @@ fn detectChompMode(header_value: []const u8) ChompMode {
         if (ch == '-') return .strip;
     }
     return .clip;
+}
+
+fn tabAtOrBefore(line: []const u8, column: usize) bool {
+    var i: usize = 0;
+    while (i < line.len and i <= column) : (i += 1) {
+        if (line[i] == '\t') return true;
+        if (line[i] != ' ') return false;
+    }
+    return false;
+}
+
+fn isClosedNode(text: []const u8) bool {
+    var value = stripTagPrefix(std.mem.trim(u8, text, " "));
+    value = stripAnchorPrefix(value);
+    value = std.mem.trimStart(u8, value, " \t");
+    if (value.len == 0) return false;
+    if (value[0] == '"' or value[0] == '\'') return hasClosingQuote(value, value[0]);
+    if (value[0] == '[' or value[0] == '{') return !Scanner.flowUnclosed(value);
+    return false;
 }
 
 fn countSpaces(line: []const u8) usize {
