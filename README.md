@@ -4,7 +4,7 @@ This library provides de/serialization for YAML.
 
 ## Usage and examples
 
-For usage and examples, see the single [basic tests](tests/basic.zig) for code examples, or the library documentation is linked in the repository description, which is generated from the source code comments (the whole library is documented and with doc tests).
+Usage examples live as doctests next to the public API in [`lib/yaml/root.zig`](lib/yaml/root.zig). Generated API documentation is linked from the repository description.
 
 ### As library
 

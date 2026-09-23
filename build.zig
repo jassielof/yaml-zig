@@ -14,7 +14,7 @@ pub fn build(b: *std.Build) void {
     const lib_mod = b.addModule(
         mod_name,
         .{
-            .root_source_file = b.path("src/lib/yaml.zig"),
+            .root_source_file = b.path("lib/yaml/root.zig"),
             .target = target,
             .optimize = optimize,
         },
@@ -27,34 +27,19 @@ pub fn build(b: *std.Build) void {
     });
 
     const docs_step = b.step("docs", "Generate the documentation");
-
     const docs_lib = b.addLibrary(.{
-        .name = "yaml_docs",
-        .root_module = b.addModule(
-            "yaml_docs",
-            .{
-                .root_source_file = b.path("src/lib/root.zig"),
-                .target = target,
-                .optimize = optimize,
-                .link_libc = true,
-                .imports = &.{
-                    .{
-                        .name = fy_mod_name,
-                        .module = fy_dep.module,
-                    },
-                },
-            },
-        ),
+        .name = "yaml",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("lib/yaml/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
     });
-
-    fy_dep.link(docs_lib.root_module);
-
     const docs = b.addInstallDirectory(.{
         .source_dir = docs_lib.getEmittedDocs(),
         .install_dir = .prefix,
         .install_subdir = "docs",
     });
-
     docs_step.dependOn(&docs.step);
 
     const build_options = b.addOptions();
@@ -62,9 +47,20 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run the test suite");
 
-    const integration_tests = b.addTest(.{
+    const unit_tests = b.addTest(.{
+        .name = "yaml",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/suite.zig"),
+            .root_source_file = b.path("lib/yaml/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(unit_tests).step);
+
+    const spec_tests = b.addTest(.{
+        .name = "spec",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/spec.zig"),
             .optimize = optimize,
             .target = target,
             .link_libc = true,
@@ -75,16 +71,6 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-
-    fy_dep.link(integration_tests.root_module);
-
-    const run_integration_tests = b.addRunArtifact(integration_tests);
-    test_step.dependOn(&run_integration_tests.step);
-
-    // const unit_tests = b.addTest(.{
-    //     .root_module = lib_mod,
-    // });
-
-    // const run_unit_tests = b.addRunArtifact(unit_tests);
-    // test_step.dependOn(&run_unit_tests.step);
+    fy_dep.link(spec_tests.root_module);
+    test_step.dependOn(&b.addRunArtifact(spec_tests).step);
 }

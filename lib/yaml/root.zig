@@ -39,6 +39,43 @@ pub fn parseDocument(
     return docs[0];
 }
 
+test parseDocument {
+    const allocator = std.testing.allocator;
+    const source =
+        \\language: zig
+        \\versions:
+        \\  - 0.15
+        \\  - 0.16
+        \\features:
+        \\  parser: true
+        \\  serializer: true
+    ;
+
+    var doc = try parseDocument(allocator, source, .{});
+    defer doc.deinit();
+
+    const map = switch (doc.root) {
+        .mapping => |m| m,
+        else => return error.TestUnexpectedResult,
+    };
+    const language = findMapValue(map.items, "language") orelse return error.TestUnexpectedResult;
+    const versions = findMapValue(map.items, "versions") orelse return error.TestUnexpectedResult;
+    const features = findMapValue(map.items, "features") orelse return error.TestUnexpectedResult;
+
+    try std.testing.expectEqualStrings("zig", switch (language.*) {
+        .string => |s| s,
+        else => return error.TestUnexpectedResult,
+    });
+    try std.testing.expectEqual(@as(usize, 2), switch (versions.*) {
+        .sequence => |seq| seq.items.len,
+        else => return error.TestUnexpectedResult,
+    });
+    try std.testing.expectEqual(@as(usize, 2), switch (features.*) {
+        .mapping => |nested| nested.items.len,
+        else => return error.TestUnexpectedResult,
+    });
+}
+
 /// Parse every document in a YAML stream.
 ///
 /// An empty stream (no document markers and no content) returns an empty slice.
@@ -59,12 +96,28 @@ pub fn parseStream(
     return Composer.composeStream(allocator, events, options);
 }
 
-test parseDocument {
+test parseStream {
     const allocator = std.testing.allocator;
-    var doc = try parseDocument(allocator, "name: Alice\nage: 30", .{});
-    defer doc.deinit();
-    // verify the root is a mapping
-    try std.testing.expect(doc.root.tag == .mapping);
+    const docs = try parseStream(allocator,
+        \\---
+        \\first
+        \\---
+        \\second
+    , .{});
+    defer {
+        for (docs) |*doc| doc.deinit();
+        allocator.free(docs);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), docs.len);
+    try std.testing.expectEqualStrings("first", switch (docs[0].root) {
+        .string => |s| s,
+        else => return error.TestUnexpectedResult,
+    });
+    try std.testing.expectEqualStrings("second", switch (docs[1].root) {
+        .string => |s| s,
+        else => return error.TestUnexpectedResult,
+    });
 }
 
 /// Format a YAML stream as yaml-test-suite events (`+STR`, `=VAL`, ...).
@@ -82,6 +135,20 @@ pub fn formatTestsuiteEvents(allocator: std.mem.Allocator, source: []const u8) !
     errdefer out.deinit(allocator);
     for (events) |ev| try appendSuiteEvent(allocator, &out, ev);
     return out.toOwnedSlice(allocator);
+}
+
+test formatTestsuiteEvents {
+    const allocator = std.testing.allocator;
+    const events = try formatTestsuiteEvents(allocator, "hello");
+    defer allocator.free(events);
+    try std.testing.expectEqualStrings(
+        \\+STR
+        \\+DOC
+        \\=VAL :hello
+        \\-DOC
+        \\-STR
+        \\
+    , events);
 }
 
 fn appendSuiteEvent(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), ev: Event.Event) !void {
@@ -179,10 +246,20 @@ pub fn parseNode(
     allocator: std.mem.Allocator,
     source: []const u8,
     options: Options.Parse,
-) !Node {
+) !Node.Node {
     var document = try parseDocument(allocator, source, options);
     defer document.deinit();
     return try document.cloneRoot(allocator);
+}
+
+test parseNode {
+    const allocator = std.testing.allocator;
+    var node = try parseNode(allocator, "[1, 2, 3]", .{});
+    defer node.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 3), switch (node) {
+        .sequence => |seq| seq.items.len,
+        else => return error.TestUnexpectedResult,
+    });
 }
 
 /// Serialize a parsed document into UTF-8 YAML bytes.
@@ -198,20 +275,102 @@ pub fn stringifyDocument(
 
 test stringifyDocument {
     const allocator = std.testing.allocator;
-    var doc = try parseDocument(allocator, "key: value", .{});
+    const source =
+        \\project:
+        \\  name: weld
+        \\  modules:
+        \\    - yaml
+        \\    - json
+    ;
+
+    var doc = try parseDocument(allocator, source, .{});
     defer doc.deinit();
 
-    const out = try stringifyDocument(allocator, &doc, .{});
-    defer allocator.free(out);
-    try std.testing.expectEqualStrings("key: value\n", out);
+    const rendered = try stringifyDocument(allocator, &doc, .{});
+    defer allocator.free(rendered);
+
+    var reparsed = try parseDocument(allocator, rendered, .{});
+    defer reparsed.deinit();
+
+    const root = switch (reparsed.root) {
+        .mapping => |m| m,
+        else => return error.TestUnexpectedResult,
+    };
+    const project = findMapValue(root.items, "project") orelse return error.TestUnexpectedResult;
+    const modules = switch (project.*) {
+        .mapping => |inner| findMapValue(inner.items, "modules") orelse return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(switch (modules.*) {
+        .sequence => true,
+        else => false,
+    });
 }
+
 /// Serialize a standalone node tree into UTF-8 YAML bytes.
 ///
 /// Returned bytes are allocated with `allocator`.
 pub fn stringifyNode(
     allocator: std.mem.Allocator,
-    node: *const Node,
+    node: *const Node.Node,
     options: Options.Stringify,
 ) ![]u8 {
     return Serializer.stringifyNode(allocator, node, options);
+}
+
+test stringifyNode {
+    const allocator = std.testing.allocator;
+    var node = try parseNode(allocator, "key: value", .{});
+    defer node.deinit(allocator);
+
+    const out = try stringifyNode(allocator, &node, .{});
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("key: value\n", out);
+}
+
+test "core scalar resolution keeps quoted values as strings" {
+    const allocator = std.testing.allocator;
+    const source =
+        \\plain_bool: true
+        \\plain_null: null
+        \\plain_int: 42
+        \\quoted_hex: "0xFFEEBB"
+        \\quoted_true: 'true'
+    ;
+
+    var doc = try parseDocument(allocator, source, .{});
+    defer doc.deinit();
+
+    const map = switch (doc.root) {
+        .mapping => |m| m,
+        else => return error.TestUnexpectedResult,
+    };
+
+    try std.testing.expect(switch ((findMapValue(map.items, "plain_bool") orelse return error.TestUnexpectedResult).*) {
+        .bool => true,
+        else => false,
+    });
+    try std.testing.expect(switch ((findMapValue(map.items, "plain_null") orelse return error.TestUnexpectedResult).*) {
+        .null => true,
+        else => false,
+    });
+    try std.testing.expectEqual(@as(i64, 42), switch ((findMapValue(map.items, "plain_int") orelse return error.TestUnexpectedResult).*) {
+        .int => |v| v,
+        else => return error.TestUnexpectedResult,
+    });
+    try std.testing.expectEqualStrings("0xFFEEBB", switch ((findMapValue(map.items, "quoted_hex") orelse return error.TestUnexpectedResult).*) {
+        .string => |v| v,
+        else => return error.TestUnexpectedResult,
+    });
+    try std.testing.expectEqualStrings("true", switch ((findMapValue(map.items, "quoted_true") orelse return error.TestUnexpectedResult).*) {
+        .string => |v| v,
+        else => return error.TestUnexpectedResult,
+    });
+}
+
+fn findMapValue(map: []const Node.MapEntry, key: []const u8) ?*const Node.Node {
+    for (map) |*entry| {
+        if (std.mem.eql(u8, entry.key, key)) return &entry.value;
+    }
+    return null;
 }

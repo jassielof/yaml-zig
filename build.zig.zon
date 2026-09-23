@@ -13,7 +13,7 @@
         "build.zig",
         "fy.build.zig",
         "build.zig.zon",
-        "src",
+        "lib",
         "LICENSE.txt",
         "README.md",
     },

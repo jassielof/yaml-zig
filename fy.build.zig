@@ -8,7 +8,7 @@ const include_paths = [_][]const u8{
     "modules/libfyaml/src/thread",
     "modules/libfyaml/src/allocator",
     "modules/libfyaml/src/blake3",
-    "src/lib/fy_config",
+    "lib/fy/fy_config",
 };
 
 const c_sources = [_][]const u8{
@@ -71,7 +71,7 @@ pub const Dependency = struct {
     pub fn link(self: Dependency, module: *std.Build.Module) void {
         module.linkLibrary(self.c_lib);
         module.addIncludePath(self.c_lib.step.owner.path("modules/libfyaml/include"));
-        module.addIncludePath(self.c_lib.step.owner.path("src/lib/fy_config"));
+        module.addIncludePath(self.c_lib.step.owner.path("lib/fy/fy_config"));
     }
 };
 
@@ -98,7 +98,7 @@ pub fn create(b: *std.Build, options: Options) Dependency {
     }
 
     const translate_c = b.addTranslateC(.{
-        .root_source_file = b.path("src/lib/fy_c.h"),
+        .root_source_file = b.path("lib/fy/fy_c.h"),
         .target = options.target,
         .optimize = options.optimize,
     });
@@ -108,7 +108,7 @@ pub fn create(b: *std.Build, options: Options) Dependency {
     const module = b.addModule(
         options.module_name,
         .{
-            .root_source_file = b.path("src/lib/fy.zig"),
+            .root_source_file = b.path("lib/fy/root.zig"),
             .target = options.target,
             .optimize = options.optimize,
             .link_libc = true,
@@ -133,7 +133,7 @@ fn addIncludePaths(module: *std.Build.Module, target: std.Build.ResolvedTarget) 
         module.addIncludePath(b.path(path));
     }
     if (target.result.os.tag == .windows) {
-        module.addIncludePath(b.path("src/lib/fy_windows"));
+        module.addIncludePath(b.path("lib/fy/fy_windows"));
     }
 }
 
@@ -143,7 +143,7 @@ fn addTranslateIncludePaths(translate_c: *std.Build.Step.TranslateC, target: std
         translate_c.addIncludePath(b.path(path));
     }
     if (target.result.os.tag == .windows) {
-        translate_c.addIncludePath(b.path("src/lib/fy_windows"));
+        translate_c.addIncludePath(b.path("lib/fy/fy_windows"));
     }
 }
 
@@ -171,7 +171,7 @@ fn addCSourceFiles(b: *std.Build, c_lib: *std.Build.Step.Compile, target: std.Bu
     });
     c_lib.root_module.addCSourceFiles(.{
         .root = b.path("."),
-        .files = &.{"src/lib/fy_diag_shim.c"},
+        .files = &.{"lib/fy/fy_diag_shim.c"},
         .flags = common_flags,
     });
 
