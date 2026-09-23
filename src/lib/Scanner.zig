@@ -11,6 +11,12 @@ pub const LineKind = enum {
     sequence_item,
     mapping_entry,
     scalar,
+    /// Value for a preceding `?` key (`: value`).
+    explicit_value,
+    /// Ends the current document. The next line starts another one.
+    document_end,
+    /// A `---` document with no content. Its node is null.
+    empty_document,
 };
 
 pub const ScannedLine = struct {
@@ -22,6 +28,9 @@ pub const ScannedLine = struct {
     value: []const u8 = "",
     style: TokenModel.ScalarStyle = .plain,
     span: Span = .{},
+    /// The key was introduced by `?`, so following indented lines belong to the key
+    /// until a matching `:` line.
+    explicit_key: bool = false,
 };
 
 pub const ScannedDocument = struct {
@@ -73,29 +82,62 @@ pub fn scan(self: *Scanner) !ScannedDocument {
     }
 
     var line_no: usize = 0;
-    var past_doc_start = false;
+    var emitted_in_doc = false;
+    var open_explicit = false;
+    var pending_directive = false;
+    var yaml_directive_count: usize = 0;
 
     while (line_no < physical.items.len) : (line_no += 1) {
         const line = physical.items[line_no];
         const indent = countIndent(line);
         var content = stripInlineComment(std.mem.trimStart(u8, line[indent..], " "));
         if (content.len == 0 or std.mem.startsWith(u8, content, "#")) continue;
-        if (!past_doc_start and content[0] == '%') continue;
+
+        // Directives are recognized only before a document has content. A '%' line
+        // after content is a plain scalar ("scalar\n%YAML 1.2").
+        if (content[0] == '%' and !emitted_in_doc) {
+            if (open_explicit) return Error.Parse.UnexpectedToken;
+            try validateDirective(content, &yaml_directive_count);
+            pending_directive = true;
+            continue;
+        }
+
+        var from_marker = false;
         // Document start "---" only when followed by space, tab, or end (not plain scalar like "---word1")
-        if (content.len >= 3 and std.mem.eql(u8, content[0..3], "---")) {
-            if (content.len == 3 or content[3] == ' ' or content[3] == '\t') {
-                past_doc_start = true;
-                content = std.mem.trimStart(u8, content[3..], " \t");
-                if (content.len == 0) continue;
+        if (isDocumentMarker(content, "---")) {
+            const rest = stripInlineComment(std.mem.trimStart(u8, content[3..], " \t"));
+            if (emitted_in_doc) {
+                try self.appendMarker(.document_end, line_no);
+                emitted_in_doc = false;
+            } else if (open_explicit) {
+                try self.appendMarker(.empty_document, line_no);
             }
+            open_explicit = true;
+            pending_directive = false;
+            yaml_directive_count = 0;
+            if (rest.len == 0) continue;
+            content = rest;
+            from_marker = true;
         }
-        if (content.len >= 3 and std.mem.eql(u8, content[0..3], "...")) {
-            if (content.len == 3 or content[3] == ' ' or content[3] == '\t') {
-                const after = std.mem.trim(u8, content[3..], " \t");
-                if (after.len != 0) return Error.Parse.UnexpectedToken;
-                continue;
+        if (!from_marker and isDocumentMarker(content, "...")) {
+            if (pending_directive) return Error.Parse.UnexpectedToken;
+            const after = std.mem.trim(u8, content[3..], " \t");
+            if (after.len != 0 and !std.mem.startsWith(u8, after, "#")) return Error.Parse.UnexpectedToken;
+            if (emitted_in_doc) {
+                try self.appendMarker(.document_end, line_no);
+                emitted_in_doc = false;
+            } else if (open_explicit) {
+                try self.appendMarker(.empty_document, line_no);
             }
+            open_explicit = false;
+            pending_directive = false;
+            continue;
         }
+
+        if (pending_directive) return Error.Parse.UnexpectedToken;
+
+        emitted_in_doc = true;
+        open_explicit = false;
 
         if (content[0] == '-' and (content.len == 1 or content[1] == ' ' or content[1] == '\t')) {
             const sequence_raw = if (content.len == 1)
@@ -104,6 +146,7 @@ pub fn scan(self: *Scanner) !ScannedDocument {
                 stripInlineComment(std.mem.trimStart(u8, content[2..], " \t"));
             const sequence_value = try joinUnclosedFlow(self.allocator, physical.items, &line_no, sequence_raw, &owned);
             const sequence_style = detectStyle(sequence_value);
+            try ensureBlockHeader(sequence_style, sequence_value);
             try self.lines.append(self.allocator, .{
                 .line_no = line_no,
                 .indent = indent,
@@ -122,14 +165,37 @@ pub fn scan(self: *Scanner) !ScannedDocument {
             else
                 std.mem.trim(u8, content[2..], " \t");
             const real_key = if (key.len > 0) stripInlineComment(key) else key;
+            const key_style = if (real_key.len > 0) detectStyle(real_key) else .plain;
+            try ensureBlockHeader(key_style, real_key);
             try self.lines.append(self.allocator, .{
                 .line_no = line_no,
                 .indent = indent,
                 .kind = .mapping_entry,
                 .key = if (real_key.len > 0) real_key else "~",
-                .key_style = if (real_key.len > 0) detectStyle(real_key) else .plain,
+                .key_style = key_style,
                 .value = "",
                 .style = .plain,
+                .span = makeSpan(line_no, indent, line.len),
+                .explicit_key = true,
+            });
+            continue;
+        }
+
+        // Explicit mapping value: ": value" at the start of the line.
+        if (content[0] == ':' and (content.len == 1 or content[1] == ' ' or content[1] == '\t')) {
+            const raw_value = if (content.len == 1)
+                ""
+            else
+                stripInlineComment(std.mem.trimStart(u8, content[2..], " \t"));
+            const value = try joinUnclosedFlow(self.allocator, physical.items, &line_no, raw_value, &owned);
+            const value_style = detectStyle(value);
+            try ensureBlockHeader(value_style, value);
+            try self.lines.append(self.allocator, .{
+                .line_no = line_no,
+                .indent = indent,
+                .kind = .explicit_value,
+                .value = trimPlainTrailing(value, value_style),
+                .style = value_style,
                 .span = makeSpan(line_no, indent, line.len),
             });
             continue;
@@ -142,6 +208,12 @@ pub fn scan(self: *Scanner) !ScannedDocument {
             const value = try joinUnclosedFlow(self.allocator, physical.items, &line_no, raw_value, &owned);
             const value_style = detectStyle(value);
             const key_style = detectStyle(key);
+            try ensureBlockHeader(key_style, key);
+            try ensureBlockHeader(value_style, value);
+            try rejectDanglingQuote(value);
+            if (value_style == .plain and findMappingColon(value) != null and (value.len == 0 or (value[0] != '[' and value[0] != '{'))) {
+                return Error.Parse.UnexpectedToken;
+            }
             try self.lines.append(self.allocator, .{
                 .line_no = line_no,
                 .indent = indent,
@@ -156,15 +228,20 @@ pub fn scan(self: *Scanner) !ScannedDocument {
         }
 
         const scalar_value = try joinUnclosedFlow(self.allocator, physical.items, &line_no, content, &owned);
+        const scalar_style = detectStyle(scalar_value);
+        try ensureBlockHeader(scalar_style, scalar_value);
         try self.lines.append(self.allocator, .{
             .line_no = line_no,
             .indent = indent,
             .kind = .scalar,
             .value = scalar_value,
-            .style = detectStyle(scalar_value),
+            .style = scalar_style,
             .span = makeSpan(line_no, indent, line.len),
         });
     }
+
+    if (pending_directive) return Error.Parse.UnexpectedToken;
+    if (open_explicit and !emitted_in_doc) try self.appendMarker(.empty_document, physical.items.len);
 
     const result_lines = self.lines;
     self.lines = .empty;
@@ -186,6 +263,9 @@ pub fn tokenizeFlow(
     defer out.deinit(allocator);
 
     var i: usize = 0;
+    // True after a quoted scalar until the next token. `:` then separates even
+    // when it is not followed by whitespace (`"key":value`, `"foo"\n  :bar`).
+    var json_key_ready = false;
     while (i < text.len) {
         const c = text[i];
         if (c == ' ' or c == '\t' or c == '\n' or c == '\r') {
@@ -195,20 +275,33 @@ pub fn tokenizeFlow(
 
         const start_col = column_base + i;
         switch (c) {
-            '[' => try out.append(allocator, .{ .kind = .lbracket, .span = makeSpan(line_no, start_col, start_col + 1) }),
-            ']' => try out.append(allocator, .{ .kind = .rbracket, .span = makeSpan(line_no, start_col, start_col + 1) }),
-            '{' => try out.append(allocator, .{ .kind = .lbrace, .span = makeSpan(line_no, start_col, start_col + 1) }),
-            '}' => try out.append(allocator, .{ .kind = .rbrace, .span = makeSpan(line_no, start_col, start_col + 1) }),
-            ',' => try out.append(allocator, .{ .kind = .comma, .span = makeSpan(line_no, start_col, start_col + 1) }),
+            '[' => {
+                json_key_ready = false;
+                try out.append(allocator, .{ .kind = .lbracket, .span = makeSpan(line_no, start_col, start_col + 1) });
+            },
+            ']' => {
+                json_key_ready = false;
+                try out.append(allocator, .{ .kind = .rbracket, .span = makeSpan(line_no, start_col, start_col + 1) });
+            },
+            '{' => {
+                json_key_ready = false;
+                try out.append(allocator, .{ .kind = .lbrace, .span = makeSpan(line_no, start_col, start_col + 1) });
+            },
+            '}' => {
+                json_key_ready = false;
+                try out.append(allocator, .{ .kind = .rbrace, .span = makeSpan(line_no, start_col, start_col + 1) });
+            },
+            ',' => {
+                json_key_ready = false;
+                try out.append(allocator, .{ .kind = .comma, .span = makeSpan(line_no, start_col, start_col + 1) });
+            },
             ':' => {
-                if (!isFlowValueColon(text, i)) {
+                if (!isFlowValueColon(text, i) and !json_key_ready) {
                     const start = i;
-                    i += 1;
-                    while (i < text.len and !isFlowValueColon(text, i) and !isFlowDelimiter(text[i]) and text[i] != '\n' and text[i] != '\r') : (i += 1) {
-                        if (text[i] == '#' and (text[i - 1] == ' ' or text[i - 1] == '\t')) break;
-                    }
-                    const lexeme = std.mem.trim(u8, text[start..i], " \t");
+                    i = nextPlainEnd(text, start + 1);
+                    const lexeme = try plainFlowLexeme(allocator, text[start..i], folded);
                     if (lexeme.len == 0) continue;
+                    json_key_ready = false;
                     try out.append(allocator, .{
                         .kind = .scalar,
                         .lexeme = lexeme,
@@ -217,9 +310,11 @@ pub fn tokenizeFlow(
                     });
                     continue;
                 }
+                json_key_ready = false;
                 try out.append(allocator, .{ .kind = .colon, .span = makeSpan(line_no, start_col, start_col + 1) });
             },
             '*', '&' => {
+                json_key_ready = false;
                 const marker = c;
                 i += 1;
                 const name_start = i;
@@ -234,11 +329,17 @@ pub fn tokenizeFlow(
                 continue;
             },
             '#' => {
-                // Comment: skip until end of line or end of text
+                if (i > 0) {
+                    const prev = text[i - 1];
+                    const separated = prev == ' ' or prev == '\t' or prev == '\n' or prev == '\r';
+                    if (!separated) return Error.Parse.UnexpectedToken;
+                }
+                // A comment does not end a JSON-like key (`{ "foo" # comment\n  :bar }`).
                 while (i < text.len and text[i] != '\n') : (i += 1) {}
                 continue;
             },
             '!' => {
+                json_key_ready = false;
                 i += 1;
                 while (i < text.len and text[i] != ' ' and text[i] != '\t' and text[i] != '\n' and !isFlowDelimiter(text[i])) : (i += 1) {}
                 continue;
@@ -272,15 +373,15 @@ pub fn tokenizeFlow(
                     .scalar_style = if (quote == '"') .double_quoted else .single_quoted,
                     .span = makeSpan(line_no, start_col, column_base + i),
                 });
+                json_key_ready = true;
                 continue;
             },
             else => {
                 const start = i;
-                while (i < text.len and !isFlowValueColon(text, i) and !isFlowDelimiter(text[i]) and text[i] != '\n' and text[i] != '\r') : (i += 1) {
-                    if (text[i] == '#' and i > start and (text[i - 1] == ' ' or text[i - 1] == '\t')) break;
-                }
-                const lexeme = std.mem.trim(u8, text[start..i], " \t");
+                i = nextPlainEnd(text, start);
+                const lexeme = try plainFlowLexeme(allocator, text[start..i], folded);
                 if (lexeme.len == 0) continue;
+                json_key_ready = false;
                 try out.append(allocator, .{
                     .kind = .scalar,
                     .lexeme = lexeme,
@@ -328,6 +429,120 @@ fn makeSpan(line_no: usize, start_col: usize, end_col: usize) Span {
     };
 }
 
+fn appendMarker(self: *Scanner, kind: LineKind, line_no: usize) !void {
+    try self.lines.append(self.allocator, .{
+        .line_no = line_no,
+        .indent = 0,
+        .kind = kind,
+    });
+}
+
+fn isDocumentMarker(content: []const u8, marker: []const u8) bool {
+    if (!std.mem.startsWith(u8, content, marker)) return false;
+    if (content.len == marker.len) return true;
+    return content[marker.len] == ' ' or content[marker.len] == '\t';
+}
+
+fn validateDirective(content: []const u8, yaml_count: *usize) !void {
+    const body = directiveBody(content);
+    const name_end = std.mem.indexOfAny(u8, body, " \t") orelse body.len;
+    const name = body[0..name_end];
+    if (std.mem.eql(u8, name, "%YAML")) {
+        const rest = std.mem.trim(u8, body[name_end..], " \t");
+        // Exactly one version token. 1.1 and 1.2 are known; any other x.y is a
+        // warning in the spec examples and still produces the following document.
+        var tokens = std.mem.tokenizeAny(u8, rest, " \t");
+        const version = tokens.next() orelse return Error.Parse.UnexpectedToken;
+        if (tokens.next() != null) return Error.Parse.UnexpectedToken;
+        if (!isYamlVersionToken(version)) return Error.Parse.UnexpectedToken;
+        yaml_count.* += 1;
+        if (yaml_count.* > 1) return Error.Parse.UnexpectedToken;
+        return;
+    }
+    if (std.mem.eql(u8, name, "%TAG")) {
+        const rest = std.mem.trim(u8, body[name_end..], " \t");
+        const split_at = std.mem.indexOfAny(u8, rest, " \t") orelse return Error.Parse.UnexpectedToken;
+        if (split_at == 0) return Error.Parse.UnexpectedToken;
+        if (std.mem.trim(u8, rest[split_at..], " \t").len == 0) return Error.Parse.UnexpectedToken;
+        return;
+    }
+    // Reserved directives (for example %FOO) are ignored.
+    if (body.len < 2 or body[0] != '%') return Error.Parse.UnexpectedToken;
+}
+
+fn rejectDanglingQuote(text: []const u8) !void {
+    if (text.len == 0 or (text[0] != '"' and text[0] != '\'')) return;
+    const quote = text[0];
+    var i: usize = 1;
+    while (i < text.len) : (i += 1) {
+        if (quote == '"' and text[i] == '\\' and i + 1 < text.len) {
+            i += 1;
+            continue;
+        }
+        if (text[i] == quote) {
+            if (quote == '\'' and i + 1 < text.len and text[i + 1] == '\'') {
+                i += 1;
+                continue;
+            }
+            i += 1;
+            break;
+        }
+    }
+    if (i >= text.len) return;
+    if (text[i] == ' ' or text[i] == '\t') {
+        const rest = std.mem.trimStart(u8, text[i..], " \t");
+        if (rest.len == 0 or rest[0] == '#') return;
+    }
+    return Error.Parse.UnexpectedToken;
+}
+
+fn isYamlVersionToken(token: []const u8) bool {
+    const dot = std.mem.indexOfScalar(u8, token, '.') orelse return false;
+    if (dot == 0 or dot + 1 >= token.len) return false;
+    for (token[0..dot]) |c| if (c < '0' or c > '9') return false;
+    for (token[dot + 1 ..]) |c| if (c < '0' or c > '9') return false;
+    return true;
+}
+
+fn directiveBody(content: []const u8) []const u8 {
+    var in_space = false;
+    for (content, 0..) |c, idx| {
+        if (c == ' ' or c == '\t') {
+            in_space = true;
+            continue;
+        }
+        if (c == '#' and in_space) return std.mem.trimEnd(u8, content[0..idx], " \t");
+        in_space = false;
+    }
+    return std.mem.trimEnd(u8, content, " \t");
+}
+
+fn ensureBlockHeader(style: TokenModel.ScalarStyle, text: []const u8) !void {
+    if (style != .literal and style != .folded) return;
+    if (text.len == 0) return;
+    var i: usize = 1;
+    var saw_chomp = false;
+    var saw_indent = false;
+    while (i < text.len) : (i += 1) {
+        switch (text[i]) {
+            '+', '-' => {
+                if (saw_chomp) return Error.Parse.UnexpectedToken;
+                saw_chomp = true;
+            },
+            '1'...'9' => {
+                if (saw_indent) return Error.Parse.UnexpectedToken;
+                saw_indent = true;
+            },
+            ' ', '\t' => {
+                const rest = std.mem.trimStart(u8, text[i..], " \t");
+                if (rest.len == 0 or rest[0] == '#') return;
+                return Error.Parse.UnexpectedToken;
+            },
+            else => return Error.Parse.UnexpectedToken,
+        }
+    }
+}
+
 fn findMappingColon(text: []const u8) ?usize {
     var in_single = false;
     var in_double = false;
@@ -335,11 +550,36 @@ fn findMappingColon(text: []const u8) ?usize {
     var depth_curly: usize = 0;
     var in_anchor = false;
     var skip_next = false;
+    const idx_start: usize = 0;
+
+    // A quoted key is quoted from the first character. An apostrophe later in a
+    // plain key is just a plain character (`a!"'()*: safe`).
+    if (text.len > 0 and (text[0] == '\'' or text[0] == '"')) {
+        const quote = text[0];
+        var i: usize = 1;
+        while (i < text.len) : (i += 1) {
+            if (quote == '"' and text[i] == '\\' and i + 1 < text.len) {
+                i += 1;
+                continue;
+            }
+            if (text[i] == quote) {
+                if (quote == '\'' and i + 1 < text.len and text[i + 1] == '\'') {
+                    i += 1;
+                    continue;
+                }
+                i += 1;
+                break;
+            }
+        }
+        while (i < text.len and (text[i] == ' ' or text[i] == '\t')) : (i += 1) {}
+        if (i < text.len and text[i] == ':') return i;
+        return null;
+    }
 
     // The value indicator is the first ": " / ":\t" / trailing ":" that is not
     // inside quotes, flow collections, or an anchor/alias name. ':' is a legal
     // anchor character, including immediately before whitespace ("&a: key").
-    for (text, 0..) |c, idx| {
+    for (text[idx_start..], idx_start..) |c, idx| {
         if (skip_next) {
             skip_next = false;
             continue;
@@ -354,10 +594,10 @@ fn findMappingColon(text: []const u8) ?usize {
                 if (in_double) skip_next = true;
             },
             '\'' => {
-                if (!in_double) in_single = !in_single;
+                if ((depth_square > 0 or depth_curly > 0) and !in_double) in_single = !in_single;
             },
             '"' => {
-                if (!in_single) in_double = !in_double;
+                if ((depth_square > 0 or depth_curly > 0) and !in_single) in_double = !in_double;
             },
             '[' => {
                 if (!in_single and !in_double) depth_square += 1;
@@ -551,6 +791,24 @@ fn foldFlowQuoted(allocator: std.mem.Allocator, inner: []const u8, folded: *std.
 
 fn isFlowDelimiter(c: u8) bool {
     return c == '[' or c == ']' or c == '{' or c == '}' or c == ',';
+}
+
+fn nextPlainEnd(text: []const u8, start: usize) usize {
+    var i = start;
+    while (i < text.len and !isFlowValueColon(text, i) and !isFlowDelimiter(text[i])) : (i += 1) {
+        if (text[i] == '#' and i > start and (text[i - 1] == ' ' or text[i - 1] == '\t' or text[i - 1] == '\n' or text[i - 1] == '\r')) break;
+    }
+    return i;
+}
+
+fn plainFlowLexeme(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+    folded: *std.ArrayListUnmanaged([]u8),
+) ![]const u8 {
+    if (std.mem.indexOfAny(u8, raw, "\n\r") == null) return std.mem.trim(u8, raw, " \t");
+    const folded_text = try foldFlowQuoted(allocator, raw, folded);
+    return std.mem.trim(u8, folded_text, " \t");
 }
 
 fn isFlowValueColon(text: []const u8, idx: usize) bool {

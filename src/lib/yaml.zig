@@ -29,6 +29,25 @@ pub fn parseDocument(
     source: []const u8,
     options: Options.Parse,
 ) !Document {
+    const docs = try parseStream(allocator, source, options);
+    defer allocator.free(docs);
+    if (docs.len == 0) return Document.init(allocator, .null);
+    if (docs.len != 1) {
+        for (docs) |*doc| doc.deinit();
+        return Error.Parse.UnexpectedToken;
+    }
+    return docs[0];
+}
+
+/// Parse every document in a YAML stream.
+///
+/// An empty stream (no document markers and no content) returns an empty slice.
+/// Each returned document must be deinited, and the slice must be freed.
+pub fn parseStream(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    options: Options.Parse,
+) ![]Document {
     var scanner = Scanner.init(allocator, source, options);
     defer scanner.deinit();
     const scanned = try scanner.scan();
@@ -37,7 +56,7 @@ pub fn parseDocument(
     defer parser.deinit();
     const events = try parser.parse();
 
-    return Composer.compose(allocator, events, options);
+    return Composer.composeStream(allocator, events, options);
 }
 
 test parseDocument {

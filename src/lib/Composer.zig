@@ -18,39 +18,61 @@ pub fn compose(
     events: []Event,
     options: Options.Parse,
 ) !Document {
+    const docs = try composeStream(allocator, events, options);
+    defer allocator.free(docs);
+    if (docs.len != 1) {
+        for (docs) |*doc| doc.deinit();
+        return Error.Parse.UnexpectedToken;
+    }
+    return docs[0];
+}
+
+/// Compose every document in a stream.
+///
+/// This function takes ownership of the `events` slice and always frees it.
+/// The returned slice is owned by `allocator`; each document must be deinited.
+pub fn composeStream(
+    allocator: std.mem.Allocator,
+    events: []Event,
+    options: Options.Parse,
+) ![]Document {
     defer freeEvents(allocator, events);
 
-    var anchors: std.StringHashMapUnmanaged(Node) = .empty;
-    defer {
-        var it = anchors.iterator();
-        while (it.next()) |entry| {
-            allocator.free(entry.key_ptr.*);
-            entry.value_ptr.deinit(allocator);
+    if (events.len < 2 or events[0].kind != .stream_start) return Error.Parse.UnexpectedToken;
+
+    var docs: std.ArrayListUnmanaged(Document) = .empty;
+    errdefer {
+        for (docs.items) |*doc| doc.deinit();
+        docs.deinit(allocator);
+    }
+
+    var index: usize = 1;
+    while (index < events.len and events[index].kind != .stream_end) {
+        if (events[index].kind != .document_start) return Error.Parse.UnexpectedToken;
+        index += 1;
+
+        var anchors: std.StringHashMapUnmanaged(Node) = .empty;
+        defer {
+            var it = anchors.iterator();
+            while (it.next()) |entry| {
+                allocator.free(entry.key_ptr.*);
+                entry.value_ptr.deinit(allocator);
+            }
+            anchors.deinit(allocator);
         }
-        anchors.deinit(allocator);
+
+        const root = try composeNode(allocator, events, &index, options, &anchors, null);
+        errdefer {
+            var owned_root = root;
+            owned_root.deinit(allocator);
+        }
+        if (index >= events.len or events[index].kind != .document_end) return Error.Parse.UnexpectedToken;
+        index += 1;
+        try docs.append(allocator, Document.init(allocator, root));
     }
 
-    if (events.len < 4) return Error.Parse.UnexpectedToken;
-    if (events[0].kind != .stream_start or events[1].kind != .document_start) {
-        return Error.Parse.UnexpectedToken;
-    }
-
-    var index: usize = 2;
-    const root = try composeNode(allocator, events, &index, options, &anchors, null);
-
-    if (index >= events.len or events[index].kind != .document_end) {
-        var owned_root = root;
-        owned_root.deinit(allocator);
-        return Error.Parse.UnexpectedToken;
-    }
-    index += 1;
-    if (index >= events.len or events[index].kind != .stream_end) {
-        var owned_root = root;
-        owned_root.deinit(allocator);
-        return Error.Parse.UnexpectedToken;
-    }
-
-    return Document.init(allocator, root);
+    if (index >= events.len or events[index].kind != .stream_end) return Error.Parse.UnexpectedToken;
+    return docs.toOwnedSlice(allocator);
 }
 
 fn composeNode(
