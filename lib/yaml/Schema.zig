@@ -15,16 +15,65 @@ pub fn resolveScalar(
     style: Token.ScalarStyle,
     resolve_core_schema: bool,
 ) !Node {
+    return resolveScalarOwned(allocator, value, false, style, resolve_core_schema);
+}
+
+/// Like `resolveScalar`, but when `value_owned` is true and the result is a
+/// string, ownership of `value` is transferred to the node (no extra copy).
+/// Non-string results free `value` when it was owned.
+pub fn resolveScalarOwned(
+    allocator: std.mem.Allocator,
+    value: []const u8,
+    value_owned: bool,
+    style: Token.ScalarStyle,
+    resolve_core_schema: bool,
+) !Node {
+    const finish_string = struct {
+        fn go(alloc: std.mem.Allocator, v: []const u8, owned: bool) !Node {
+            if (owned) return .{ .string = @constCast(v) };
+            return .{ .string = try alloc.dupe(u8, v) };
+        }
+    }.go;
+
+    const drop_owned = struct {
+        fn go(alloc: std.mem.Allocator, v: []const u8, owned: bool) void {
+            if (owned) alloc.free(v);
+        }
+    }.go;
+
     if (!resolve_core_schema or style != .plain) {
-        return .{ .string = try allocator.dupe(u8, value) };
+        return finish_string(allocator, value, value_owned);
     }
 
-    if (isNull(value)) return .null;
-    if (isBool(value)) |b| return .{ .bool = b };
-    if (parseInt(allocator, value)) |v| return .{ .int = v } else |_| {}
-    if (parseFloat(allocator, value)) |v| return .{ .float = v } else |_| {}
+    if (isNull(value)) {
+        drop_owned(allocator, value, value_owned);
+        return .null;
+    }
+    if (isBool(value)) |b| {
+        drop_owned(allocator, value, value_owned);
+        return .{ .bool = b };
+    }
 
-    return .{ .string = try allocator.dupe(u8, value) };
+    if (couldBeNumber(value)) {
+        if (parseInt(allocator, value)) |v| {
+            drop_owned(allocator, value, value_owned);
+            return .{ .int = v };
+        } else |_| {}
+        if (parseFloat(allocator, value)) |v| {
+            drop_owned(allocator, value, value_owned);
+            return .{ .float = v };
+        } else |_| {}
+    }
+
+    return finish_string(allocator, value, value_owned);
+}
+
+/// Cheap gate before int/float parsing. Underscores and hex/oct prefixes are handled inside.
+fn couldBeNumber(value: []const u8) bool {
+    const text = std.mem.trim(u8, value, " ");
+    if (text.len == 0) return false;
+    const c = text[0];
+    return (c >= '0' and c <= '9') or c == '-' or c == '+' or c == '.';
 }
 
 fn isNull(value: []const u8) bool {

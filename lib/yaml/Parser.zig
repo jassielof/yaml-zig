@@ -14,8 +14,6 @@ scanned: Scanner.ScannedDocument,
 options: Options.Parse,
 events: std.ArrayListUnmanaged(EventModel.Event) = .empty,
 index: usize = 0,
-/// Physical source lines, built once for block-scalar collection.
-raw_lines: ?std.ArrayListUnmanaged([]const u8) = null,
 
 pub fn init(allocator: std.mem.Allocator, scanned: Scanner.ScannedDocument, options: Options.Parse) Parser {
     return .{
@@ -29,7 +27,7 @@ pub fn deinit(self: *Parser) void {
     for (self.events.items) |ev| {
         switch (ev.kind) {
             .scalar => {
-                self.allocator.free(ev.data.scalar.value);
+                if (ev.data.scalar.value_owned) self.allocator.free(ev.data.scalar.value);
                 if (ev.data.scalar.anchor) |anchor| self.allocator.free(anchor);
                 if (ev.data.scalar.tag) |tag| self.allocator.free(tag);
             },
@@ -46,7 +44,6 @@ pub fn deinit(self: *Parser) void {
         }
     }
     self.events.deinit(self.allocator);
-    if (self.raw_lines) |*lines| lines.deinit(self.allocator);
     self.scanned.deinit(self.allocator);
     self.* = undefined;
 }
@@ -1019,23 +1016,6 @@ fn isCompactSequence(text: []const u8) bool {
     return text.len >= 1 and text[0] == '-' and (text.len == 1 or text[1] == ' ' or text[1] == '\t');
 }
 
-fn ensureRawLines(self: *Parser) ![]const []const u8 {
-    if (self.raw_lines == null) {
-        var lines: std.ArrayListUnmanaged([]const u8) = .empty;
-        errdefer lines.deinit(self.allocator);
-        var split = std.mem.splitScalar(u8, self.scanned.source, '\n');
-        while (split.next()) |rl| {
-            try lines.append(self.allocator, stripCR(rl));
-        }
-        // Trailing empty entry from a final newline is not a physical line.
-        if (lines.items.len > 0 and lines.items[lines.items.len - 1].len == 0) {
-            _ = lines.pop();
-        }
-        self.raw_lines = lines;
-    }
-    return self.raw_lines.?.items;
-}
-
 fn collectBlockScalar(
     self: *Parser,
     parent_indent: usize,
@@ -1054,7 +1034,7 @@ fn collectBlockScalar(
 
     self.index += 1;
 
-    const raw_lines = try self.ensureRawLines();
+    const raw_lines = self.scanned.physical.items;
 
     var base_indent: ?usize = if (explicit_indent) |ei| parent_indent + ei else null;
     var block_end: usize = header_line_no + 1;
@@ -1920,15 +1900,30 @@ fn pushDocumentStart(self: *Parser, explicit: bool) anyerror!void {
 }
 
 fn pushScalar(self: *Parser, value: []const u8, style: Token.ScalarStyle, anchor: ?[]const u8, span: @import("Span.zig")) anyerror!void {
+    // Borrow plain slices of the input source; only copy when the value lives in a
+    // temporary buffer (joined lines, block-scalar rebuild, normalized quotes, …).
+    const borrow = value.len == 0 or isSubslice(self.scanned.source, value);
+    const stored: []const u8 = if (borrow) value else try self.allocator.dupe(u8, value);
+    errdefer if (!borrow) self.allocator.free(stored);
+
     try self.events.append(self.allocator, .{
         .kind = .scalar,
         .data = .{ .scalar = .{
-            .value = try self.allocator.dupe(u8, value),
+            .value = stored,
             .style = style,
             .anchor = if (anchor) |a| try self.allocator.dupe(u8, a) else null,
             .span = span,
+            .value_owned = !borrow,
         } },
     });
+}
+
+fn isSubslice(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    const n_start = @intFromPtr(needle.ptr);
+    const h_start = @intFromPtr(haystack.ptr);
+    const h_end = h_start + haystack.len;
+    return n_start >= h_start and n_start + needle.len <= h_end;
 }
 
 fn pushSimple(self: *Parser, kind: EventModel.Kind, span: @import("Span.zig")) anyerror!void {

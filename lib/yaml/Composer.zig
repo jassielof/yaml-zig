@@ -88,17 +88,25 @@ fn composeNode(
     switch (ev.kind) {
         .scalar => {
             index.* += 1;
-            const resolved = if (ev.data.scalar.tag) |tag|
-                try resolveTaggedScalar(allocator, tag, ev.data.scalar.value)
+            const scalar = ev.data.scalar;
+            const resolved = if (scalar.tag) |tag|
+                blk: {
+                    const node = try resolveTaggedScalar(allocator, tag, scalar.value);
+                    if (scalar.value_owned) allocator.free(scalar.value);
+                    break :blk node;
+                }
             else
-                try Schema.resolveScalar(
+                try Schema.resolveScalarOwned(
                     allocator,
-                    ev.data.scalar.value,
-                    ev.data.scalar.style,
+                    scalar.value,
+                    scalar.value_owned,
+                    scalar.style,
                     options.resolve_core_schema,
                 );
+            // Ownership transferred into `resolved` (or freed). Prevent freeEvents double-free.
+            events[index.* - 1].data.scalar.value_owned = false;
 
-            if (ev.data.scalar.anchor) |anchor_name| {
+            if (scalar.anchor) |anchor_name| {
                 if (skip_anchor == null or !std.mem.eql(u8, anchor_name, skip_anchor.?)) {
                     try putAnchor(allocator, anchors, anchor_name, resolved);
                 }
@@ -208,7 +216,7 @@ pub fn freeEvents(allocator: std.mem.Allocator, events: []Event) void {
     for (events) |ev| {
         switch (ev.kind) {
             .scalar => {
-                allocator.free(ev.data.scalar.value);
+                if (ev.data.scalar.value_owned) allocator.free(ev.data.scalar.value);
                 if (ev.data.scalar.anchor) |anchor| allocator.free(anchor);
                 if (ev.data.scalar.tag) |tag| allocator.free(tag);
             },

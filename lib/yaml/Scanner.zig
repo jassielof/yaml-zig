@@ -42,12 +42,15 @@ pub const ScannedLine = struct {
 pub const ScannedDocument = struct {
     source: []const u8,
     lines: std.ArrayListUnmanaged(ScannedLine),
+    /// Physical source lines (CR-stripped). Shared with the parser for block scalars.
+    physical: std.ArrayListUnmanaged([]const u8) = .empty,
     /// Buffers for values joined across physical lines (multiline flow).
     owned: std.ArrayListUnmanaged([]u8) = .empty,
 
     pub fn deinit(self: *ScannedDocument, allocator: std.mem.Allocator) void {
         for (self.owned.items) |buf| allocator.free(buf);
         self.owned.deinit(allocator);
+        self.physical.deinit(allocator);
         self.lines.deinit(allocator);
         self.* = undefined;
     }
@@ -75,10 +78,14 @@ pub fn deinit(self: *Scanner) void {
 
 pub fn scan(self: *Scanner) !ScannedDocument {
     var physical: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer physical.deinit(self.allocator);
+    errdefer physical.deinit(self.allocator);
     var split = std.mem.splitScalar(u8, self.source, '\n');
     while (split.next()) |raw_line| {
         try physical.append(self.allocator, stripCarriageReturn(raw_line));
+    }
+    // Match Parser.ensureRawLines: a trailing empty split entry is not a line.
+    if (physical.items.len > 0 and physical.items[physical.items.len - 1].len == 0) {
+        _ = physical.pop();
     }
 
     var owned: std.ArrayListUnmanaged([]u8) = .empty;
@@ -346,6 +353,7 @@ pub fn scan(self: *Scanner) !ScannedDocument {
     return .{
         .source = self.source,
         .lines = result_lines,
+        .physical = physical,
         .owned = owned,
     };
 }
@@ -1022,7 +1030,10 @@ fn joinUnclosedFlow(
         try buf.append(allocator, '\n');
         try buf.appendSlice(allocator, cont);
     }
-    if (i == index.* + 1) return initial;
+    if (i == index.* + 1) {
+        buf.deinit(allocator);
+        return initial;
+    }
 
     index.* = i - 1;
     const slice = try buf.toOwnedSlice(allocator);

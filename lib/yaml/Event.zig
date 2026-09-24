@@ -38,6 +38,9 @@ pub const Scalar = struct {
     anchor: ?[]const u8 = null,
     tag: ?[]const u8 = null,
     span: Span = .{},
+    /// When true, `value` is heap memory owned by the event and must be freed
+    /// (or transferred) by the consumer. When false, `value` borrows the parse source.
+    value_owned: bool = false,
 };
 
 pub const DocumentStart = struct {
