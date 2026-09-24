@@ -12,6 +12,7 @@
         "build.zig",
         "build.zig.zon",
         "build",
+        "bench",
         "lib",
         "LICENSE.txt",
         "README.md",

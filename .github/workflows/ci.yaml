@@ -78,6 +78,28 @@ jobs:
           MATRIX_OS: ${{ matrix.os }}
         run: zig build coverage-summary
 
+  bench:
+    name: Benchmark
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      - name: Setup Zig
+        uses: jassielof/setup-zig@main
+
+      - name: Download reference YAML
+        run: |
+          mkdir -p zig-out/bench-data
+          curl -fsSL -o zig-out/bench-data/bundle.yaml \
+            https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/main/bundle.yaml
+
+      - name: Bench
+        run: zig build bench --summary all -- zig-out/bench-data/bundle.yaml
+
   pages:
     name: Deploy to GitHub Pages
     environment:

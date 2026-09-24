@@ -67,6 +67,40 @@ pub fn build(b: *std.Build) void {
     fy_dep.link(spec_tests.root_module);
     test_step.dependOn(&b.addRunArtifact(spec_tests).step);
 
+    // Bench always uses ReleaseFast for the timed artifacts so Debug CI/local
+    // defaults do not poison throughput numbers. Pass -Doptimize=ReleaseFast
+    // (or other) only if you also want the rest of the build graph in that mode.
+    const bench_fy = fy.create(b, .{
+        .module_name = "fy_bench",
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const bench_exe = b.addExecutable(.{
+        .name = "bench-parse",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/parse.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .link_libc = true,
+            .imports = &.{
+                .{
+                    .name = "yaml",
+                    .module = b.createModule(.{
+                        .root_source_file = b.path("lib/yaml/root.zig"),
+                        .target = target,
+                        .optimize = .ReleaseFast,
+                    }),
+                },
+                .{ .name = "fy", .module = bench_fy.module },
+            },
+        }),
+    });
+    bench_fy.link(bench_exe.root_module);
+    const run_bench = b.addRunArtifact(bench_exe);
+    if (b.args) |args| run_bench.addArgs(args);
+    const bench_step = b.step("bench", "Benchmark pure Zig YAML against libfyaml (ReleaseFast)");
+    bench_step.dependOn(&run_bench.step);
+
     const coverage_summary = b.addExecutable(.{
         .name = "coverage-summary",
         .root_module = b.createModule(.{

@@ -50,6 +50,30 @@ pub fn parseDocument(source: []const u8) Error!Document {
     return .{ .raw = raw };
 }
 
+/// Parse every document in a YAML stream and destroy each after construction.
+///
+/// Used by benchmarks so multi-document inputs exercise the same "build all
+/// documents" work as `yaml.parseStream`, without retaining the trees.
+pub fn parseStreamDiscard(source: []const u8) Error!void {
+    var cfg = std.mem.zeroes(c.struct_fy_parse_cfg);
+    cfg.flags = @as(@TypeOf(cfg.flags), c.FYPCF_QUIET | c.FYPCF_RESOLVE_DOCUMENT);
+    const diag = fyz_create_silent_diag();
+    defer if (diag) |resolved| c.fy_diag_destroy(resolved);
+    cfg.diag = diag;
+
+    const parser = c.fy_parser_create(&cfg) orelse return error.ParseFailed;
+    defer c.fy_parser_destroy(parser);
+
+    if (c.fy_parser_set_string(parser, @ptrCast(source.ptr), source.len) != 0) {
+        return error.ParseFailed;
+    }
+
+    while (c.fy_parse_load_document(parser)) |raw| {
+        var doc: Document = .{ .raw = raw };
+        doc.deinit();
+    }
+}
+
 pub fn parseTestsuiteEventsAlloc(allocator: std.mem.Allocator, source: []const u8) Error![]u8 {
     const result = try parseTestsuiteEventsDetailedAlloc(allocator, source);
     return result.events;
