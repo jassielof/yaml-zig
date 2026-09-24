@@ -553,4 +553,3 @@ test "round-trip parse emit parse" {
     defer doc2.deinit();
     try std.testing.expectEqual(@as(usize, 2), doc2.root.mapping.items.len);
 }
-
