@@ -374,3 +374,87 @@ fn findMapValue(map: []const Node.MapEntry, key: []const u8) ?*const Node.Node {
     }
     return null;
 }
+
+test "block scalar body may contain mapping-like text" {
+    const a = std.testing.allocator;
+    const src =
+        \\a: |-
+        \\  Valid values: "=" (equality), "!=" (inequality), "=~" (regex match), "!~" (regex non-match).
+        \\b: x
+    ;
+    var doc = try parseDocument(a, src, .{});
+    defer doc.deinit();
+    try std.testing.expect(doc.root == .mapping);
+    const desc = doc.root.mapping.items[0].value;
+    try std.testing.expect(desc == .string);
+    try std.testing.expect(std.mem.indexOf(u8, desc.string, "\"=\"") != null);
+}
+
+test "sequence item mapping folds multiline plain values" {
+    const a = std.testing.allocator;
+    const src =
+        \\items:
+        \\  - message: externalId can only be used when roleArn is
+        \\      specified
+        \\    rule: '!has(self.externalId) || has(self.roleArn)'
+    ;
+    var doc = try parseDocument(a, src, .{});
+    defer doc.deinit();
+    const item = doc.root.mapping.items[0].value.sequence.items[0];
+    try std.testing.expect(item == .mapping);
+    try std.testing.expectEqual(@as(usize, 2), item.mapping.items.len);
+    try std.testing.expectEqualStrings(
+        "externalId can only be used when roleArn is specified",
+        item.mapping.items[0].value.string,
+    );
+    try std.testing.expectEqualStrings(
+        "!has(self.externalId) || has(self.roleArn)",
+        item.mapping.items[1].value.string,
+    );
+}
+
+test "multiline single-quoted mapping value" {
+    const a = std.testing.allocator;
+    const src =
+        \\path:
+        \\  description: 'Required: Path is  the relative
+        \\    path name of the file to be created. Must
+        \\    not be absolute or contain the ''..''
+        \\    path. Must be utf-8 encoded. The first
+        \\    item of the relative path must not start
+        \\    with ''..'''
+        \\  type: string
+    ;
+    var doc = try parseDocument(a, src, .{});
+    defer doc.deinit();
+    const desc = doc.root.mapping.items[0].value.mapping.items[0].value.string;
+    try std.testing.expectEqualStrings(
+        "Required: Path is  the relative path name of the file to be created. Must not be absolute or contain the '..' path. Must be utf-8 encoded. The first item of the relative path must not start with '..'",
+        desc,
+    );
+}
+
+test "reject dangling quote after mapping value" {
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.UnexpectedToken, parseDocument(a, "k: \"v\" trailing\n", .{}));
+}
+
+test "markdown table lines are plain scalars not block headers" {
+    const a = std.testing.allocator;
+    const src =
+        \\desc: |
+        \\  | zone1 | zone2 |
+        \\  |  P P  |  P P  |
+        \\next: ok
+    ;
+    var doc = try parseDocument(a, src, .{});
+    defer doc.deinit();
+    const text = doc.root.mapping.items[0].value.string;
+    try std.testing.expect(std.mem.indexOf(u8, text, "| zone1 |") != null);
+}
+
+test "invalid block scalar indent indicators still rejected" {
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.UnexpectedToken, parseDocument(a, "--- |0\n", .{}));
+    try std.testing.expectError(error.UnexpectedToken, parseDocument(a, "--- |10\n", .{}));
+}

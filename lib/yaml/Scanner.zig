@@ -97,6 +97,10 @@ pub fn scan(self: *Scanner) !ScannedDocument {
     var doc_has_tag_directive = false;
     var next_doc_explicit = false;
     var awaiting_explicit_value = false;
+    // After a `|` / `>` header, more-indented lines are opaque body content.
+    // Parser.collectBlockScalar re-reads them from the source; the scanner must
+    // not classify them as mapping/sequence entries (e.g. `Valid values: "=" …`).
+    var block_scalar_indent: ?usize = null;
 
     while (line_no < physical.items.len) : (line_no += 1) {
         const line = physical.items[line_no];
@@ -107,6 +111,11 @@ pub fn scan(self: *Scanner) !ScannedDocument {
         if (content.len == 0 or std.mem.startsWith(u8, content, "#")) {
             if (raw_content.len > 0 and raw_content[0] == '#') comment_pending = true;
             continue;
+        }
+
+        if (block_scalar_indent) |bi| {
+            if (indent > bi) continue;
+            block_scalar_indent = null;
         }
 
         // Directives are recognized only before a document has content. A '%' line
@@ -194,6 +203,7 @@ pub fn scan(self: *Scanner) !ScannedDocument {
                 .style = sequence_style,
                 .span = makeSpan(line_no, indent, line.len),
             });
+            noteBlockScalarHeader(&block_scalar_indent, indent, sequence_style);
             self.stampComment(&comment_pending, line_ends_with_comment, &next_doc_explicit);
             continue;
         }
@@ -224,6 +234,7 @@ pub fn scan(self: *Scanner) !ScannedDocument {
                 .span = makeSpan(line_no, indent, line.len),
                 .explicit_key = true,
             });
+            noteBlockScalarHeader(&block_scalar_indent, indent, key_style);
             awaiting_explicit_value = true;
             self.stampComment(&comment_pending, line_ends_with_comment, &next_doc_explicit);
             continue;
@@ -250,6 +261,7 @@ pub fn scan(self: *Scanner) !ScannedDocument {
                     .style = value_style,
                     .span = makeSpan(line_no, indent, line.len),
                 });
+                noteBlockScalarHeader(&block_scalar_indent, indent, value_style);
                 self.stampComment(&comment_pending, line_ends_with_comment, &next_doc_explicit);
                 continue;
             }
@@ -269,6 +281,7 @@ pub fn scan(self: *Scanner) !ScannedDocument {
                 .style = value_style,
                 .span = makeSpan(line_no, indent, line.len),
             });
+            noteBlockScalarHeader(&block_scalar_indent, indent, value_style);
             self.stampComment(&comment_pending, line_ends_with_comment, &next_doc_explicit);
             continue;
         }
@@ -296,6 +309,7 @@ pub fn scan(self: *Scanner) !ScannedDocument {
                 .style = value_style,
                 .span = makeSpan(line_no, indent, line.len),
             });
+            noteBlockScalarHeader(&block_scalar_indent, indent, value_style);
             self.stampComment(&comment_pending, line_ends_with_comment, &next_doc_explicit);
             continue;
         }
@@ -303,8 +317,15 @@ pub fn scan(self: *Scanner) !ScannedDocument {
         const flow_head = std.mem.trimStart(u8, content, " \t");
         const flow_opens_line = !from_marker and flow_head.len > 0 and (flow_head[0] == '[' or flow_head[0] == '{');
         const scalar_value = try joinUnclosedFlow(self.allocator, physical.items, &line_no, content, &owned, indent, flow_opens_line);
-        const scalar_style = detectStyle(scalar_value);
-        try ensureBlockHeader(scalar_style, scalar_value);
+        var scalar_style = detectStyle(scalar_value);
+        // Bare lines such as `| zone1 |` or `>= v1.2"` are plain content, not
+        // block-scalar headers. Invalid header *attempts* (`|0`, `|10`) still error.
+        if (scalar_style == .literal or scalar_style == .folded) {
+            ensureBlockHeader(scalar_style, scalar_value) catch {
+                if (!softenInvalidBlockHeader(scalar_value)) return Error.Parse.UnexpectedToken;
+                scalar_style = .plain;
+            };
+        }
         try self.lines.append(self.allocator, .{
             .line_no = line_no,
             .indent = indent,
@@ -313,6 +334,7 @@ pub fn scan(self: *Scanner) !ScannedDocument {
             .style = scalar_style,
             .span = makeSpan(line_no, indent, line.len),
         });
+        noteBlockScalarHeader(&block_scalar_indent, indent, scalar_style);
         self.stampComment(&comment_pending, line_ends_with_comment, &next_doc_explicit);
     }
 
@@ -743,6 +765,10 @@ fn rejectDanglingQuote(text: []const u8) !void {
     return Error.Parse.UnexpectedToken;
 }
 
+fn noteBlockScalarHeader(block_indent: *?usize, indent: usize, style: TokenModel.ScalarStyle) void {
+    if (style == .literal or style == .folded) block_indent.* = indent;
+}
+
 fn isYamlVersionToken(token: []const u8) bool {
     const dot = std.mem.indexOfScalar(u8, token, '.') orelse return false;
     if (dot == 0 or dot + 1 >= token.len) return false;
@@ -788,6 +814,25 @@ fn ensureBlockHeader(style: TokenModel.ScalarStyle, text: []const u8) !void {
             else => return Error.Parse.UnexpectedToken,
         }
     }
+}
+
+/// True when `|…` / `>…` is clearly not a block-scalar header attempt (e.g. a
+/// markdown table row or a quoted-string continuation) and should be scanned as
+/// plain text instead of rejected.
+fn softenInvalidBlockHeader(text: []const u8) bool {
+    if (text.len < 2) return false;
+    const c = text[1];
+    // `| zone1 |` / `> folded prose`
+    if (c == ' ' or c == '\t') {
+        const rest = std.mem.trimStart(u8, text[1..], " \t");
+        return rest.len > 0 and rest[0] != '#';
+    }
+    // Digits (including invalid `0`) mean a header attempt — keep the error.
+    if (c >= '0' and c <= '9') return false;
+    // Chomp indicators mean a header attempt (`|--`, `|+0`).
+    if (c == '+' or c == '-') return false;
+    // Anything else (`>=…`, `||…`) is plain content.
+    return true;
 }
 
 fn findMappingColon(text: []const u8) ?usize {

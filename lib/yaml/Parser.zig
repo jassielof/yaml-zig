@@ -454,6 +454,12 @@ fn emitSequenceItemMapping(self: *Parser, line: Scanner.ScannedLine, seq_indent:
             const block = try self.collectBlockScalar(seq_indent + 2, vs, raw_val, line.line_no);
             defer self.allocator.free(block);
             try self.pushScalar(block, vs, null, .{});
+        } else if (vs == .plain) {
+            // Fold indented continuation lines into the plain value
+            // (`- message: …\n    specified`).
+            const joined = try self.collectPlainContinuation(seq_indent + 1, raw_val);
+            defer self.allocator.free(joined);
+            try self.parseScalarLikeValue(joined, .plain, line.line_no, seq_indent + 2);
         } else {
             try self.parseScalarLikeValue(raw_val, vs, line.line_no, seq_indent + 2);
             self.index += 1;
@@ -1797,23 +1803,10 @@ fn hasTrailingEscapedNewline(content: []const u8) bool {
 }
 
 fn hasClosingQuote(text: []const u8, quote: u8) bool {
-    if (text.len < 2) return false;
-    if (text[0] != quote or text[text.len - 1] != quote) return false;
-    if (quote == '"') {
-        var slash_count: usize = 0;
-        var i: usize = text.len - 2;
-        while (true) {
-            if (text[i] == '\\') {
-                slash_count += 1;
-            } else {
-                break;
-            }
-            if (i == 0) break;
-            i -= 1;
-        }
-        if ((slash_count % 2) != 0) return false;
-    }
-    return true;
+    // Use the escape-aware scan (`''` in single-quoted, `\"` in double-quoted).
+    // A naive "starts and ends with quote" check falsely closes on content like
+    // `'… ''..''` before the real terminator.
+    return closingQuoteIndex(text, quote) != null;
 }
 
 const ChompMode = enum { clip, strip, keep };
