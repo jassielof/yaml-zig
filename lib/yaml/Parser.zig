@@ -14,6 +14,8 @@ scanned: Scanner.ScannedDocument,
 options: Options.Parse,
 events: std.ArrayListUnmanaged(EventModel.Event) = .empty,
 index: usize = 0,
+/// Physical source lines, built once for block-scalar collection.
+raw_lines: ?std.ArrayListUnmanaged([]const u8) = null,
 
 pub fn init(allocator: std.mem.Allocator, scanned: Scanner.ScannedDocument, options: Options.Parse) Parser {
     return .{
@@ -44,6 +46,7 @@ pub fn deinit(self: *Parser) void {
         }
     }
     self.events.deinit(self.allocator);
+    if (self.raw_lines) |*lines| lines.deinit(self.allocator);
     self.scanned.deinit(self.allocator);
     self.* = undefined;
 }
@@ -1016,6 +1019,23 @@ fn isCompactSequence(text: []const u8) bool {
     return text.len >= 1 and text[0] == '-' and (text.len == 1 or text[1] == ' ' or text[1] == '\t');
 }
 
+fn ensureRawLines(self: *Parser) ![]const []const u8 {
+    if (self.raw_lines == null) {
+        var lines: std.ArrayListUnmanaged([]const u8) = .empty;
+        errdefer lines.deinit(self.allocator);
+        var split = std.mem.splitScalar(u8, self.scanned.source, '\n');
+        while (split.next()) |rl| {
+            try lines.append(self.allocator, stripCR(rl));
+        }
+        // Trailing empty entry from a final newline is not a physical line.
+        if (lines.items.len > 0 and lines.items[lines.items.len - 1].len == 0) {
+            _ = lines.pop();
+        }
+        self.raw_lines = lines;
+    }
+    return self.raw_lines.?.items;
+}
+
 fn collectBlockScalar(
     self: *Parser,
     parent_indent: usize,
@@ -1034,19 +1054,7 @@ fn collectBlockScalar(
 
     self.index += 1;
 
-    // Build raw line index from source
-    var raw_lines: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer raw_lines.deinit(self.allocator);
-    {
-        var split = std.mem.splitScalar(u8, self.scanned.source, '\n');
-        while (split.next()) |rl| {
-            try raw_lines.append(self.allocator, stripCR(rl));
-        }
-        // Remove trailing empty entry from split (artifact of trailing newline)
-        if (raw_lines.items.len > 0 and raw_lines.items[raw_lines.items.len - 1].len == 0) {
-            _ = raw_lines.pop();
-        }
-    }
+    const raw_lines = try self.ensureRawLines();
 
     var base_indent: ?usize = if (explicit_indent) |ei| parent_indent + ei else null;
     var block_end: usize = header_line_no + 1;
@@ -1056,8 +1064,8 @@ fn collectBlockScalar(
 
     {
         var ri = header_line_no + 1;
-        while (ri < raw_lines.items.len) : (ri += 1) {
-            const rline = raw_lines.items[ri];
+        while (ri < raw_lines.len) : (ri += 1) {
+            const rline = raw_lines[ri];
             const li = countSpaces(rline);
             const is_blank = (li >= rline.len);
 
@@ -1106,7 +1114,7 @@ fn collectBlockScalar(
     if (style == .literal) {
         var ri = header_line_no + 1;
         while (ri < block_end) : (ri += 1) {
-            const rline = raw_lines.items[ri];
+            const rline = raw_lines[ri];
             const li = countSpaces(rline);
 
             if (li >= rline.len) {
@@ -1131,7 +1139,7 @@ fn collectBlockScalar(
 
         var ri = header_line_no + 1;
         while (ri < block_end) : (ri += 1) {
-            const rline = raw_lines.items[ri];
+            const rline = raw_lines[ri];
             const li = countSpaces(rline);
             const is_blank = (li >= rline.len);
 
