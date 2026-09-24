@@ -9,7 +9,6 @@ pub const Error = @import("Error.zig");
 pub const Options = @import("Options.zig");
 pub const Token = @import("Token.zig");
 pub const Event = @import("Event.zig");
-pub const Input = @import("Input.zig");
 pub const Scanner = @import("Scanner.zig");
 pub const Parser = @import("Parser.zig");
 pub const Scalar = @import("Scalar.zig");
@@ -19,6 +18,8 @@ pub const Document = @import("Document.zig");
 pub const Composer = @import("Composer.zig");
 pub const Emitter = @import("Emitter.zig");
 pub const Serializer = @import("Serializer.zig");
+pub const Reflect = @import("Reflect.zig");
+pub const CharClass = @import("CharClass.zig");
 
 /// Parse YAML text into a heap-owning `Document`.
 ///
@@ -31,7 +32,9 @@ pub fn parseDocument(
 ) !Document {
     const docs = try parseStream(allocator, source, options);
     defer allocator.free(docs);
-    if (docs.len == 0) return Document.init(allocator, .null);
+    if (docs.len == 0) {
+        return Document.init(allocator, std.heap.ArenaAllocator.init(allocator), .null);
+    }
     if (docs.len != 1) {
         for (docs) |*doc| doc.deinit();
         return Error.Parse.UnexpectedToken;
@@ -94,6 +97,49 @@ pub fn parseStream(
     const events = try parser.parse();
 
     return Composer.composeStream(allocator, events, options);
+}
+
+/// Parse YAML into a flat event stream (SAX-style).
+///
+/// The caller owns the returned slice and must free it with
+/// `Composer.freeEvents`. No `Document` tree is built.
+pub fn parseEvents(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    options: Options.Parse,
+) ![]Event.Event {
+    var scanner = Scanner.init(allocator, source, options);
+    defer scanner.deinit();
+    const scanned = try scanner.scan();
+
+    var parser = Parser.init(allocator, scanned, options);
+    defer parser.deinit();
+    return parser.parse();
+}
+
+test parseEvents {
+    const allocator = std.testing.allocator;
+    const events = try parseEvents(allocator, "a: 1\n", .{});
+    defer Composer.freeEvents(allocator, events);
+    try std.testing.expect(events.len >= 4);
+    try std.testing.expect(events[0].kind == .stream_start);
+}
+
+/// Parse YAML into a typed Zig value (`std.json.parseFromSlice`-style).
+///
+/// String fields are allocated with `allocator` and must be freed by the caller
+/// (or live in an arena).
+pub fn parseFromSlice(comptime T: type, allocator: std.mem.Allocator, source: []const u8, options: Options.Parse) !T {
+    var doc = try parseDocument(allocator, source, options);
+    defer doc.deinit();
+    return Reflect.fromNode(T, allocator, doc.root);
+}
+
+/// Serialize a Zig value to YAML text.
+pub fn stringifyFrom(allocator: std.mem.Allocator, value: anytype, options: Options.Stringify) ![]u8 {
+    var node = try Reflect.toNode(allocator, value);
+    defer node.deinit(allocator);
+    return Serializer.stringifyNode(allocator, &node, options);
 }
 
 test parseStream {
@@ -458,3 +504,53 @@ test "invalid block scalar indent indicators still rejected" {
     try std.testing.expectError(error.UnexpectedToken, parseDocument(a, "--- |0\n", .{}));
     try std.testing.expectError(error.UnexpectedToken, parseDocument(a, "--- |10\n", .{}));
 }
+
+test "document path accessor" {
+    const a = std.testing.allocator;
+    var doc = try parseDocument(a,
+        \\metadata:
+        \\  name: demo
+        \\items:
+        \\  - id: 1
+    , .{});
+    defer doc.deinit();
+    const name = doc.get("metadata.name") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("demo", name.string);
+    const id = doc.get("items.0.id") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, 1), id.int);
+}
+
+test "parseFromSlice typed struct" {
+    const a = std.testing.allocator;
+    const Config = struct {
+        name: []const u8,
+        count: i64,
+        enabled: bool = true,
+    };
+    const cfg = try parseFromSlice(Config, a,
+        \\name: zig
+        \\count: 3
+    , .{});
+    defer a.free(cfg.name);
+    try std.testing.expectEqualStrings("zig", cfg.name);
+    try std.testing.expectEqual(@as(i64, 3), cfg.count);
+    try std.testing.expect(cfg.enabled);
+}
+
+test "round-trip parse emit parse" {
+    const a = std.testing.allocator;
+    const src =
+        \\a: 1
+        \\b:
+        \\  - x
+        \\  - y
+    ;
+    var doc1 = try parseDocument(a, src, .{});
+    defer doc1.deinit();
+    const emitted = try Serializer.stringifyDocument(a, &doc1, .{});
+    defer a.free(emitted);
+    var doc2 = try parseDocument(a, emitted, .{});
+    defer doc2.deinit();
+    try std.testing.expectEqual(@as(usize, 2), doc2.root.mapping.items.len);
+}
+

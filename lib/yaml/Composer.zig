@@ -31,6 +31,8 @@ pub fn compose(
 ///
 /// This function takes ownership of the `events` slice and always frees it.
 /// The returned slice is owned by `allocator`; each document must be deinited.
+///
+/// Each document's node tree lives in that document's arena (O(1) `deinit`).
 pub fn composeStream(
     allocator: std.mem.Allocator,
     events: []Event,
@@ -51,24 +53,18 @@ pub fn composeStream(
         if (events[index].kind != .document_start) return Error.Parse.UnexpectedToken;
         index += 1;
 
-        var anchors: std.StringHashMapUnmanaged(Node) = .empty;
-        defer {
-            var it = anchors.iterator();
-            while (it.next()) |entry| {
-                allocator.free(entry.key_ptr.*);
-                entry.value_ptr.deinit(allocator);
-            }
-            anchors.deinit(allocator);
-        }
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer _ = arena.deinit();
+        const a = arena.allocator();
 
-        const root = try composeNode(allocator, events, &index, options, &anchors, null);
-        errdefer {
-            var owned_root = root;
-            owned_root.deinit(allocator);
-        }
+        // Anchor map and node memory both live in the document arena.
+        var anchors: std.StringHashMapUnmanaged(Node) = .empty;
+
+        const root = try composeNode(a, events, &index, options, &anchors, null);
         if (index >= events.len or events[index].kind != .document_end) return Error.Parse.UnexpectedToken;
         index += 1;
-        try docs.append(allocator, Document.init(allocator, root));
+
+        try docs.append(allocator, Document.init(allocator, arena, root));
     }
 
     if (index >= events.len or events[index].kind != .stream_end) return Error.Parse.UnexpectedToken;
@@ -89,22 +85,17 @@ fn composeNode(
         .scalar => {
             index.* += 1;
             const scalar = ev.data.scalar;
+            // Always copy into the document arena. Event buffers (possibly GPA-owned)
+            // stay marked `value_owned` so freeEvents can release them.
             const resolved = if (scalar.tag) |tag|
-                blk: {
-                    const node = try resolveTaggedScalar(allocator, tag, scalar.value);
-                    if (scalar.value_owned) allocator.free(scalar.value);
-                    break :blk node;
-                }
+                try resolveTaggedScalar(allocator, tag, scalar.value)
             else
-                try Schema.resolveScalarOwned(
+                try Schema.resolveScalar(
                     allocator,
                     scalar.value,
-                    scalar.value_owned,
                     scalar.style,
                     options.resolve_core_schema,
                 );
-            // Ownership transferred into `resolved` (or freed). Prevent freeEvents double-free.
-            events[index.* - 1].data.scalar.value_owned = false;
 
             if (scalar.anchor) |anchor_name| {
                 if (skip_anchor == null or !std.mem.eql(u8, anchor_name, skip_anchor.?)) {
@@ -118,10 +109,6 @@ fn composeNode(
             const seq_anchor = ev.data.sequence_start.anchor;
             index.* += 1;
             var seq: std.ArrayListUnmanaged(Node) = .empty;
-            errdefer {
-                for (seq.items) |*item| item.deinit(allocator);
-                seq.deinit(allocator);
-            }
 
             while (index.* < events.len and events[index.*].kind != .sequence_end) {
                 try seq.append(allocator, try composeNode(allocator, events, index, options, anchors, null));
@@ -138,19 +125,14 @@ fn composeNode(
             const map_anchor = ev.data.mapping_start.anchor;
             index.* += 1;
             var map: std.ArrayListUnmanaged(MapEntry) = .empty;
-            errdefer {
-                for (map.items) |*entry| {
-                    allocator.free(entry.key);
-                    entry.value.deinit(allocator);
-                }
-                map.deinit(allocator);
-            }
+            // O(1) duplicate-key checks (CRD `properties` blocks are wide).
+            var seen: std.StringHashMapUnmanaged(usize) = .empty;
 
             while (index.* < events.len and events[index.*].kind != .mapping_end) {
                 const key_ev = events[index.*];
                 const key = switch (key_ev.kind) {
                     .scalar => blk: {
-                        var resolved_key = if (key_ev.data.scalar.tag) |tag|
+                        const resolved_key = if (key_ev.data.scalar.tag) |tag|
                             try resolveTaggedScalar(allocator, tag, key_ev.data.scalar.value)
                         else
                             try Schema.resolveScalar(
@@ -159,7 +141,6 @@ fn composeNode(
                                 key_ev.data.scalar.style,
                                 options.resolve_core_schema,
                             );
-                        defer resolved_key.deinit(allocator);
                         if (key_ev.data.scalar.anchor) |anchor_name| {
                             try putAnchor(allocator, anchors, anchor_name, resolved_key);
                         }
@@ -172,27 +153,23 @@ fn composeNode(
                     },
                     else => return Error.Parse.InvalidMappingKey,
                 };
-                errdefer allocator.free(key);
                 index.* += 1;
                 const key_anchor = if (key_ev.kind == .scalar) key_ev.data.scalar.anchor else null;
-                var value = try composeNode(allocator, events, index, options, anchors, key_anchor);
-                errdefer value.deinit(allocator);
+                const value = try composeNode(allocator, events, index, options, anchors, key_anchor);
 
-                if (findMapKey(map.items, key)) |existing_idx| {
+                if (seen.get(key)) |existing_idx| {
                     switch (options.duplicate_keys) {
-                        .reject => {
-                            return Error.Parse.DuplicateKey;
-                        },
+                        .reject => return Error.Parse.DuplicateKey,
                         .keep_last => {
-                            allocator.free(map.items[existing_idx].key);
-                            map.items[existing_idx].value.deinit(allocator);
                             map.items[existing_idx] = .{ .key = key, .value = value };
                             continue;
                         },
                     }
                 }
 
+                const idx = map.items.len;
                 try map.append(allocator, .{ .key = key, .value = value });
+                try seen.put(allocator, key, idx);
             }
             if (index.* >= events.len or events[index.*].kind != .mapping_end) return Error.Parse.UnexpectedToken;
             index.* += 1;
@@ -206,6 +183,7 @@ fn composeNode(
             const alias_name = ev.data.alias.name;
             const aliased = anchors.get(alias_name) orelse return Error.Parse.InvalidAlias;
             index.* += 1;
+            // Clone only when the anchor is actually referenced.
             return aliased.clone(allocator);
         },
         else => return Error.Parse.UnexpectedToken,
@@ -235,19 +213,19 @@ pub fn freeEvents(allocator: std.mem.Allocator, events: []Event) void {
     allocator.free(events);
 }
 
+/// Record an anchor without cloning. The node already lives in the document
+/// arena; clones happen on first alias use.
 fn putAnchor(
     allocator: std.mem.Allocator,
     anchors: *std.StringHashMapUnmanaged(Node),
     name: []const u8,
     value: Node,
 ) !void {
-    if (anchors.getEntry(name)) |entry| {
-        entry.value_ptr.deinit(allocator);
-        entry.value_ptr.* = try value.clone(allocator);
-        return;
+    const gop = try anchors.getOrPut(allocator, name);
+    if (!gop.found_existing) {
+        gop.key_ptr.* = try allocator.dupe(u8, name);
     }
-
-    try anchors.put(allocator, try allocator.dupe(u8, name), try value.clone(allocator));
+    gop.value_ptr.* = value;
 }
 
 fn resolveTaggedScalar(allocator: std.mem.Allocator, tag: []const u8, value: []const u8) !Node {
@@ -271,11 +249,4 @@ fn nodeToKeyString(allocator: std.mem.Allocator, node: Node) ![]u8 {
         .string => |v| try allocator.dupe(u8, v),
         else => Error.Parse.InvalidMappingKey,
     };
-}
-
-fn findMapKey(items: []const MapEntry, key: []const u8) ?usize {
-    for (items, 0..) |entry, idx| {
-        if (std.mem.eql(u8, entry.key, key)) return idx;
-    }
-    return null;
 }

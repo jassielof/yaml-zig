@@ -120,11 +120,10 @@ fn runSpecCoverage(backend: Backend) !void {
     printCoverageSummary(backend, total, passed, failed, unsupported, coverage_percent, failure_details.items, groups.items, summary_only);
 
     try testing.expect(total > 0);
-    if (backend == .fy) {
-        try testing.expectEqual(total, passed);
-        try testing.expectEqual(@as(usize, 0), unsupported);
-        try testing.expectEqual(@as(usize, 0), failed);
-    }
+    // Hard gate: both backends must stay at full yaml-test-suite coverage.
+    try testing.expectEqual(total, passed);
+    try testing.expectEqual(@as(usize, 0), unsupported);
+    try testing.expectEqual(@as(usize, 0), failed);
 }
 
 // ---------------------------------------------------------------------------

@@ -586,9 +586,7 @@ fn stripCarriageReturn(line: []const u8) []const u8 {
 }
 
 fn countIndent(line: []const u8) usize {
-    var i: usize = 0;
-    while (i < line.len and line[i] == ' ') : (i += 1) {}
-    return i;
+    return @import("CharClass.zig").countLeadingSpaces(line);
 }
 
 fn detectStyle(value: []const u8) TokenModel.ScalarStyle {
