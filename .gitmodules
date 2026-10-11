@@ -4,6 +4,6 @@
 [submodule "modules/libfyaml"]
 	path = modules/libfyaml
 	url = https://github.com/pantoniou/libfyaml
-[submodule "dependencies/scz"]
-	path = dependencies/scz
-	url = https://github.com/jassielof/scz
+[submodule "dependencies/sierra"]
+	path = dependencies/sierra
+	url = https://github.com/jassielof/sierra
