@@ -15,12 +15,14 @@ pub fn resolveScalar(
     style: Token.ScalarStyle,
     resolve_core_schema: bool,
 ) !Node {
-    return resolveScalarOwned(allocator, value, false, style, resolve_core_schema);
+    return resolveScalarInDocument(allocator, value, false, false, null, null, style, resolve_core_schema);
 }
 
 /// Like `resolveScalar`, but when `value_owned` is true and the result is a
 /// string, ownership of `value` is transferred to the node (no extra copy).
 /// Non-string results free `value` when it was owned.
+///
+/// Prefer `resolveScalarInDocument` when composing into a document arena.
 pub fn resolveScalarOwned(
     allocator: std.mem.Allocator,
     value: []const u8,
@@ -28,44 +30,87 @@ pub fn resolveScalarOwned(
     style: Token.ScalarStyle,
     resolve_core_schema: bool,
 ) !Node {
+    return resolveScalarInDocument(allocator, value, value_owned, false, null, null, style, resolve_core_schema);
+}
+
+/// Resolve a scalar into a document node.
+///
+/// When `pinned` is set, string results borrow that slice (already in the document
+/// arena). When `value_owned` is true, event memory is released via `event_gpa`
+/// after copying into `allocator` (typically the document arena).
+pub fn resolveScalarInDocument(
+    doc_allocator: std.mem.Allocator,
+    value: []const u8,
+    value_owned: bool,
+    pool_backed: bool,
+    event_gpa: ?std.mem.Allocator,
+    pinned: ?[]const u8,
+    style: Token.ScalarStyle,
+    resolve_core_schema: bool,
+) !Node {
     const finish_string = struct {
-        fn go(alloc: std.mem.Allocator, v: []const u8, owned: bool) !Node {
-            if (owned) return .{ .string = @constCast(v) };
+        fn go(
+            alloc: std.mem.Allocator,
+            v: []const u8,
+            owned: bool,
+            pool: bool,
+            ev_gpa: ?std.mem.Allocator,
+            pin: ?[]const u8,
+        ) !Node {
+            if (pin) |p| return .{ .string = @constCast(p) };
+            if (owned and pool) return .{ .string = @constCast(v) };
+            if (owned) {
+                if (ev_gpa) |gpa| {
+                    const s = try alloc.dupe(u8, v);
+                    gpa.free(v);
+                    return .{ .string = s };
+                }
+                return .{ .string = @constCast(v) };
+            }
             return .{ .string = try alloc.dupe(u8, v) };
         }
     }.go;
 
-    const drop_owned = struct {
-        fn go(alloc: std.mem.Allocator, v: []const u8, owned: bool) void {
-            if (owned) alloc.free(v);
+    const release_owned = struct {
+        fn go(gpa: ?std.mem.Allocator, v: []const u8, owned: bool, pool: bool) void {
+            if (owned and !pool) if (gpa) |g| g.free(v);
         }
     }.go;
 
     if (!resolve_core_schema or style != .plain) {
-        return finish_string(allocator, value, value_owned);
+        return finish_string(doc_allocator, value, value_owned, pool_backed, event_gpa, pinned);
     }
 
     if (isNull(value)) {
-        drop_owned(allocator, value, value_owned);
+        release_owned(event_gpa, value, value_owned, pool_backed);
         return .null;
     }
     if (isBool(value)) |b| {
-        drop_owned(allocator, value, value_owned);
+        release_owned(event_gpa, value, value_owned, pool_backed);
         return .{ .bool = b };
     }
 
     if (couldBeNumber(value)) {
-        if (parseInt(allocator, value)) |v| {
-            drop_owned(allocator, value, value_owned);
+        if (parseInt(doc_allocator, value)) |v| {
+            release_owned(event_gpa, value, value_owned, pool_backed);
             return .{ .int = v };
         } else |_| {}
-        if (parseFloat(allocator, value)) |v| {
-            drop_owned(allocator, value, value_owned);
+        if (parseFloat(doc_allocator, value)) |v| {
+            release_owned(event_gpa, value, value_owned, pool_backed);
             return .{ .float = v };
         } else |_| {}
     }
 
-    return finish_string(allocator, value, value_owned);
+    return finish_string(doc_allocator, value, value_owned, pool_backed, event_gpa, pinned);
+}
+
+/// Whether a plain scalar must go through Core schema resolution (null/bool/number).
+pub fn plainScalarNeedsCoreResolution(value: []const u8) bool {
+    if (value.len == 0) return true;
+    if (isNull(value)) return true;
+    if (isBool(value) != null) return true;
+    if (couldBeNumber(value)) return true;
+    return false;
 }
 
 /// Cheap gate before int/float parsing. Underscores and hex/oct prefixes are handled inside.
@@ -111,7 +156,7 @@ fn parseInt(allocator: std.mem.Allocator, value: []const u8) !i64 {
     }
 
     const normalized = try removeUnderscores(allocator, text);
-    defer allocator.free(normalized);
+    defer if (normalized.ptr != text.ptr) allocator.free(normalized);
     if (normalized.len == 0) return error.InvalidCharacter;
 
     const magnitude = try std.fmt.parseInt(i64, normalized, base);
@@ -126,11 +171,13 @@ fn parseFloat(allocator: std.mem.Allocator, value: []const u8) !f64 {
     if (std.ascii.eqlIgnoreCase(text, ".nan")) return std.math.nan(f64);
 
     const normalized = try removeUnderscores(allocator, text);
-    defer allocator.free(normalized);
+    defer if (normalized.ptr != text.ptr) allocator.free(normalized);
     return std.fmt.parseFloat(f64, normalized);
 }
 
-fn removeUnderscores(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+fn removeUnderscores(allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
+    if (std.mem.indexOfScalar(u8, value, '_') == null) return value;
+
     var final_len: usize = 0;
     for (value) |ch| {
         if (ch != '_') final_len += 1;

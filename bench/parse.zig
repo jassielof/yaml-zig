@@ -47,14 +47,14 @@ pub fn sierraFinish(init: std.process.Init, results: []const sierra.Result) !voi
 
 fn parseYaml(gpa: std.mem.Allocator, wl: cases.Workload) !void {
     if (wl.multi) {
-        const docs = try yaml.parseStream(gpa, wl.source, .{});
+        const docs = try yaml.parseStream(gpa, wl.source, .{ .retain_input = false });
         defer {
             for (docs) |*doc| doc.deinit();
             gpa.free(docs);
         }
         sierra.keepAlive(docs.len);
     } else {
-        var doc = try yaml.parseDocument(gpa, wl.source, .{});
+        var doc = try yaml.parseDocument(gpa, wl.source, .{ .retain_input = false });
         defer doc.deinit();
         sierra.keepAlive(@intFromPtr(&doc));
     }
@@ -72,6 +72,11 @@ fn parseFy(wl: cases.Workload) !void {
 
 fn runNamed(b: *sierra.Bench, backend: enum { yaml, fy }, wl: cases.Workload) !void {
     b.setBytes(wl.source.len);
+    b.options.label = wl.name;
+    b.options.group = switch (backend) {
+        .yaml => "yaml",
+        .fy => "fy",
+    };
     // Zig allocator tracking only for yaml-zig. libfyaml uses C malloc —
     // leave allocation metrics unavailable rather than reporting zeros.
     if (backend == .yaml) b.enableAllocationTracking();

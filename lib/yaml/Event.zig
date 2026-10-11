@@ -41,6 +41,9 @@ pub const Scalar = struct {
     /// When true, `value` is heap memory owned by the event and must be freed
     /// (or transferred) by the consumer. When false, `value` borrows the parse source.
     value_owned: bool = false,
+    /// When true with `value_owned`, bytes live in the stream `OwnedScalarPool` arena
+    /// (not the parse GPA) and must not be `free`d by the parser or composer.
+    pool_backed: bool = false,
 };
 
 pub const DocumentStart = struct {

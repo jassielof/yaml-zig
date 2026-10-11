@@ -6,28 +6,67 @@ const EventModel = @import("Event.zig");
 const Options = @import("Options.zig");
 const Scanner = @import("Scanner.zig");
 const Token = @import("Token.zig");
+const Composer = @import("Composer.zig");
 
 pub const Parser = @This();
+
+const EmitSink = enum {
+    /// Normal path: buffer in `events` or feed `stream` directly.
+    direct,
+    /// Flow collections may `insert` events; buffer locally then flush to `stream`.
+    flow_scratch,
+};
 
 allocator: std.mem.Allocator,
 scanned: Scanner.ScannedDocument,
 options: Options.Parse,
+/// Allocator for rebuilt scalar buffers (defaults to `allocator`).
+scalar_allocator: std.mem.Allocator,
+scalar_pool_backed: bool = false,
+stream: ?*Composer.Stream = null,
+emit_sink: EmitSink = .direct,
+flow_scratch: std.ArrayListUnmanaged(EventModel.Event) = .empty,
+pending_scalar_tag: ?[]const u8 = null,
 events: std.ArrayListUnmanaged(EventModel.Event) = .empty,
 index: usize = 0,
 
 pub fn init(allocator: std.mem.Allocator, scanned: Scanner.ScannedDocument, options: Options.Parse) Parser {
+    return initWithScalarPool(allocator, scanned, options, null, null);
+}
+
+pub fn initWithScalarPool(
+    allocator: std.mem.Allocator,
+    scanned: Scanner.ScannedDocument,
+    options: Options.Parse,
+    scalar_pool: ?*@import("Document.zig").OwnedScalarPool,
+    stream: ?*Composer.Stream,
+) Parser {
     return .{
         .allocator = allocator,
         .scanned = scanned,
         .options = options,
+        .scalar_allocator = if (scalar_pool) |p| p.arena.allocator() else allocator,
+        .scalar_pool_backed = scalar_pool != null,
+        .stream = stream,
     };
 }
 
 pub fn deinit(self: *Parser) void {
-    for (self.events.items) |ev| {
+    self.freeEventSlice(self.events.items);
+    self.events.deinit(self.allocator);
+    self.freeEventSlice(self.flow_scratch.items);
+    self.flow_scratch.deinit(self.allocator);
+    self.scanned.deinit(self.allocator);
+    self.* = undefined;
+}
+
+fn freeEventSlice(self: *Parser, slice: []EventModel.Event) void {
+    for (slice) |ev| {
         switch (ev.kind) {
             .scalar => {
-                if (ev.data.scalar.value_owned) self.allocator.free(ev.data.scalar.value);
+                if (ev.data.scalar.value_owned and !ev.data.scalar.pool_backed) {
+                    self.allocator.free(ev.data.scalar.value);
+                }
                 if (ev.data.scalar.anchor) |anchor| self.allocator.free(anchor);
                 if (ev.data.scalar.tag) |tag| self.allocator.free(tag);
             },
@@ -43,12 +82,29 @@ pub fn deinit(self: *Parser) void {
             else => {},
         }
     }
-    self.events.deinit(self.allocator);
-    self.scanned.deinit(self.allocator);
-    self.* = undefined;
 }
 
 pub fn parse(self: *Parser) ![]EventModel.Event {
+    if (self.stream != null) return Error.Parse.UnexpectedToken;
+    try self.runParseLoop();
+    const owned = try self.events.toOwnedSlice(self.allocator);
+    self.events = .empty;
+    return owned;
+}
+
+pub fn parseComposed(self: *Parser) !void {
+    if (self.stream == null) return Error.Parse.UnexpectedToken;
+    try self.runParseLoop();
+}
+
+fn runParseLoop(self: *Parser) !void {
+    if (self.stream == null) {
+        const line_count = self.scanned.lines.items.len;
+        if (line_count > 0) {
+            try self.events.ensureTotalCapacity(self.allocator, line_count * 4 + 32);
+        }
+    }
+
     try self.pushSimple(.stream_start, .{});
 
     while (self.index < self.scanned.lines.items.len) {
@@ -79,10 +135,48 @@ pub fn parse(self: *Parser) ![]EventModel.Event {
     }
 
     try self.pushSimple(.stream_end, .{});
+}
 
-    const owned = try self.events.toOwnedSlice(self.allocator);
-    self.events = .empty;
-    return owned;
+fn usesStreamFeed(self: *Parser) bool {
+    return self.stream != null and self.emit_sink == .direct;
+}
+
+fn activeEventList(self: *Parser) *std.ArrayListUnmanaged(EventModel.Event) {
+    if (self.emit_sink == .flow_scratch) return &self.flow_scratch;
+    return &self.events;
+}
+
+fn flushFlowScratch(self: *Parser) !void {
+    if (self.flow_scratch.items.len == 0) return;
+    if (self.stream) |s| {
+        for (self.flow_scratch.items) |ev| {
+            try s.feed(self.allocator, ev);
+        }
+    } else {
+        try self.events.appendSlice(self.allocator, self.flow_scratch.items);
+    }
+    self.flow_scratch.clearRetainingCapacity();
+}
+
+fn commitFlowScratch(self: *Parser) !void {
+    if (self.stream != null) try self.flushFlowScratch();
+}
+
+fn eventInsert(self: *Parser, index: usize, ev: EventModel.Event) !void {
+    try self.activeEventList().insert(self.allocator, index, ev);
+}
+
+fn emitEvent(self: *Parser, ev_in: EventModel.Event) !void {
+    var ev = ev_in;
+    if (ev.kind == .scalar and self.pending_scalar_tag != null) {
+        ev.data.scalar.tag = try self.allocator.dupe(u8, self.pending_scalar_tag.?);
+        self.pending_scalar_tag = null;
+    }
+    if (self.usesStreamFeed()) {
+        try self.stream.?.feed(self.allocator, ev);
+        return;
+    }
+    try self.activeEventList().append(self.allocator, ev);
 }
 
 fn parseBlockValue(self: *Parser, indent: usize, is_root: bool) anyerror!void {
@@ -102,8 +196,7 @@ fn parseBlockValue(self: *Parser, indent: usize, is_root: bool) anyerror!void {
 
     if (line.kind == .scalar and (line.style == .literal or line.style == .folded)) {
         const block = try self.collectBlockScalar(line.indent, line.style, line.value, line.line_no);
-        defer self.allocator.free(block);
-        try self.pushScalar(block, line.style, null, line.span);
+        try self.pushScalarOwned(block, line.style, null, line.span);
         return;
     }
 
@@ -131,7 +224,7 @@ fn parseBlockValue(self: *Parser, indent: usize, is_root: bool) anyerror!void {
             const anchor_to_attach = if (anc.name.len > 0) anc.name else null;
             if (next.kind == .sequence_item and next.indent >= indent) {
                 if (anchor_to_attach) |a| {
-                    try self.events.append(self.allocator, .{
+                    try self.emitEvent( .{
                         .kind = .sequence_start,
                         .data = .{ .sequence_start = .{
                             .style = .block,
@@ -160,7 +253,7 @@ fn parseBlockValue(self: *Parser, indent: usize, is_root: bool) anyerror!void {
             }
             if (next.kind == .mapping_entry and next.indent >= indent) {
                 if (anchor_to_attach) |a| {
-                    try self.events.append(self.allocator, .{
+                    try self.emitEvent( .{
                         .kind = .mapping_start,
                         .data = .{ .mapping_start = .{
                             .style = .block,
@@ -189,7 +282,7 @@ fn parseBlockValue(self: *Parser, indent: usize, is_root: bool) anyerror!void {
 }
 
 fn parseBlockSequence(self: *Parser, indent: usize) anyerror!void {
-    try self.events.append(self.allocator, .{
+    try self.emitEvent( .{
         .kind = .sequence_start,
         .data = .{ .sequence_start = .{ .style = .block } },
     });
@@ -223,8 +316,8 @@ fn parseBlockSequence(self: *Parser, indent: usize) anyerror!void {
                     continue;
                 }
             }
+            try self.prepareScalarTag(canonicalTag(raw_trimmed));
             try self.pushScalar("", .plain, seq_anc, line.span);
-            try self.tagLastScalar(canonicalTag(raw_trimmed));
             continue;
         }
 
@@ -232,7 +325,7 @@ fn parseBlockSequence(self: *Parser, indent: usize) anyerror!void {
         const trimmed_val = std.mem.trimStart(u8, line.value, " ");
         if (trimmed_val.len >= 2 and trimmed_val[0] == '-' and (trimmed_val[1] == ' ' or trimmed_val[1] == '\t')) {
             const nested_indent = indent + 2;
-            try self.events.append(self.allocator, .{
+            try self.emitEvent( .{
                 .kind = .sequence_start,
                 .data = .{ .sequence_start = .{ .style = .block } },
             });
@@ -280,8 +373,7 @@ fn parseBlockSequence(self: *Parser, indent: usize) anyerror!void {
         // Block scalar value
         if (line.style == .literal or line.style == .folded) {
             const block = try self.collectBlockScalar(line.indent, line.style, line.value, line.line_no);
-            defer self.allocator.free(block);
-            try self.pushScalar(block, line.style, null, line.span);
+            try self.pushScalarOwned(block, line.style, null, line.span);
             continue;
         }
 
@@ -340,7 +432,7 @@ fn parseBlockSequence(self: *Parser, indent: usize) anyerror!void {
 fn parseCompactExplicit(self: *Parser, line: Scanner.ScannedLine, seq_indent: usize) anyerror!void {
     const raw = std.mem.trim(u8, line.value, " \t");
     const rest = std.mem.trim(u8, if (raw.len <= 1) "" else raw[1..], " \t");
-    try self.events.append(self.allocator, .{
+    try self.emitEvent( .{
         .kind = .mapping_start,
         .data = .{ .mapping_start = .{ .style = .block } },
     });
@@ -363,7 +455,7 @@ fn parseExplicitKeyNode(self: *Parser, rest: []const u8, line: Scanner.ScannedLi
     self.index += 1;
     if (rest[0] == ':' and (rest.len == 1 or rest[1] == ' ' or rest[1] == '\t')) {
         const inner = if (rest.len <= 1) "" else std.mem.trimStart(u8, rest[2..], " \t");
-        try self.events.append(self.allocator, .{
+        try self.emitEvent( .{
             .kind = .mapping_start,
             .data = .{ .mapping_start = .{ .style = .block } },
         });
@@ -419,6 +511,7 @@ fn parseExplicitValueLine(self: *Parser, seq_indent: usize, span: @import("Span.
     if ((text[0] == '[' or text[0] == '{') or Scanner.findInlineMappingColon(text) != null) {
         if (text[0] == '[' or text[0] == '{') {
             try self.parseFlow(text, next.line_no, col);
+            try self.commitFlowScratch();
         } else {
             try self.emitInlineMappingValue(text, col, next.line_no);
         }
@@ -433,7 +526,7 @@ fn emitSequenceItemMapping(self: *Parser, line: Scanner.ScannedLine, seq_indent:
     const key = std.mem.trimEnd(u8, original[0..col_idx], " \t");
     const raw_val = std.mem.trimStart(u8, original[col_idx + 1 ..], " \t");
 
-    try self.events.append(self.allocator, .{
+    try self.emitEvent( .{
         .kind = .mapping_start,
         .data = .{ .mapping_start = .{ .style = .block } },
     });
@@ -452,8 +545,7 @@ fn emitSequenceItemMapping(self: *Parser, line: Scanner.ScannedLine, seq_indent:
         const vs = detectInlineStyle(raw_val);
         if (vs == .literal or vs == .folded) {
             const block = try self.collectBlockScalar(seq_indent + 2, vs, raw_val, line.line_no);
-            defer self.allocator.free(block);
-            try self.pushScalar(block, vs, null, .{});
+            try self.pushScalarOwned(block, vs, null, .{});
         } else if (vs == .plain) {
             // Fold indented continuation lines into the plain value
             // (`- message: …\n    specified`).
@@ -478,7 +570,7 @@ fn emitSequenceItemMapping(self: *Parser, line: Scanner.ScannedLine, seq_indent:
 
 fn emitVirtualEmptyBlock(self: *Parser, next_line: Scanner.ScannedLine, anchor: ?[]const u8) anyerror!void {
     if (next_line.kind == .sequence_item) {
-        try self.events.append(self.allocator, .{
+        try self.emitEvent( .{
             .kind = .sequence_start,
             .data = .{ .sequence_start = .{
                 .style = .block,
@@ -502,7 +594,7 @@ fn emitVirtualEmptyBlock(self: *Parser, next_line: Scanner.ScannedLine, anchor: 
         }
         try self.pushSimple(.sequence_end, .{});
     } else if (next_line.kind == .mapping_entry) {
-        try self.events.append(self.allocator, .{
+        try self.emitEvent( .{
             .kind = .mapping_start,
             .data = .{ .mapping_start = .{
                 .style = .block,
@@ -529,14 +621,12 @@ fn emitInlineMappingValue(self: *Parser, text: []const u8, parent_indent: usize,
     const key = std.mem.trimEnd(u8, working[0..col_idx], " \t");
     const raw_val = std.mem.trimStart(u8, working[col_idx + 1 ..], " \t");
 
-    try self.events.append(self.allocator, .{
+    try self.emitEvent( .{
         .kind = .mapping_start,
         .data = .{ .mapping_start = .{ .style = .block } },
     });
     const ks = detectInlineStyle(key);
-    const nk = try normalizeScalar(self.allocator, key, ks);
-    defer self.allocator.free(nk);
-    try self.pushScalar(nk, ks, null, .{});
+    try self.pushScalarNormalized(key, ks, null, .{});
     if (raw_val.len == 0) {
         try self.pushScalar("", .plain, null, .{});
     } else {
@@ -548,7 +638,7 @@ fn emitInlineMappingValue(self: *Parser, text: []const u8, parent_indent: usize,
 fn emitNestedSequenceValue(self: *Parser, value: []const u8, parent_indent: usize, line_no: usize, span: @import("Span.zig")) anyerror!void {
     const trimmed = std.mem.trimStart(u8, value, " ");
     if (trimmed.len >= 2 and trimmed[0] == '-' and (trimmed[1] == ' ' or trimmed[1] == '\t')) {
-        try self.events.append(self.allocator, .{
+        try self.emitEvent( .{
             .kind = .sequence_start,
             .data = .{ .sequence_start = .{ .style = .block } },
         });
@@ -567,7 +657,7 @@ fn emitNestedSequenceValue(self: *Parser, value: []const u8, parent_indent: usiz
 }
 
 fn parseBlockMapping(self: *Parser, indent: usize) anyerror!void {
-    try self.events.append(self.allocator, .{
+    try self.emitEvent( .{
         .kind = .mapping_start,
         .data = .{ .mapping_start = .{ .style = .block } },
     });
@@ -598,20 +688,16 @@ fn emitSingleMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_inden
         } else if (key_anchor != null and isAliasToken(key_without_anchor) != null) {
             return Error.Parse.UnexpectedToken;
         } else if (isAliasToken(key_without_anchor)) |alias_name| {
-            try self.events.append(self.allocator, .{
+            try self.emitEvent( .{
                 .kind = .alias,
                 .data = .{ .alias = .{ .name = try self.allocator.dupe(u8, alias_name), .span = line.span } },
             });
         } else {
             const effective_key_style = detectInlineStyle(key_without_anchor);
-            const normalized_key = try normalizeScalar(self.allocator, key_without_anchor, effective_key_style);
-            defer self.allocator.free(normalized_key);
-            try self.pushScalar(normalized_key, effective_key_style, key_anchor, line.span);
+            try self.pushScalarNormalized(key_without_anchor, effective_key_style, key_anchor, line.span);
         }
     } else {
-        const normalized_key = try normalizeScalar(self.allocator, key_without_anchor, line.key_style);
-        defer self.allocator.free(normalized_key);
-        try self.pushScalar(normalized_key, line.key_style, key_anchor, line.span);
+        try self.pushScalarNormalized(key_without_anchor, line.key_style, key_anchor, line.span);
     }
 
     // Emit value
@@ -629,7 +715,7 @@ fn emitSingleMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_inden
             if (next.indent > parent_indent) {
                 if (maybe_anchor) |anch| {
                     if (next.kind == .sequence_item) {
-                        try self.events.append(self.allocator, .{
+                        try self.emitEvent( .{
                             .kind = .sequence_start,
                             .data = .{ .sequence_start = .{
                                 .style = .block,
@@ -653,7 +739,7 @@ fn emitSingleMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_inden
                         try self.pushSimple(.sequence_end, .{});
                         return;
                     } else if (next.kind == .mapping_entry) {
-                        try self.events.append(self.allocator, .{
+                        try self.emitEvent( .{
                             .kind = .mapping_start,
                             .data = .{ .mapping_start = .{
                                 .style = .block,
@@ -688,13 +774,12 @@ fn emitSingleMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_inden
                                 const nn = self.scanned.lines.items[self.index];
                                 if (nn.kind == .scalar and (nn.style == .literal or nn.style == .folded)) {
                                     const block = try self.collectBlockScalar(parent_indent, nn.style, nn.value, nn.line_no);
-                                    defer self.allocator.free(block);
-                                    try self.pushScalar(block, nn.style, nv_anchor, line.span);
+                                    try self.pushScalarOwned(block, nn.style, nv_anchor, line.span);
                                     return;
                                 }
                                 if (nv_anchor) |anch| {
                                     if (nn.kind == .sequence_item and nn.indent >= parent_indent) {
-                                        try self.events.append(self.allocator, .{
+                                        try self.emitEvent( .{
                                             .kind = .sequence_start,
                                             .data = .{ .sequence_start = .{
                                                 .style = .block,
@@ -718,7 +803,7 @@ fn emitSingleMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_inden
                                         try self.pushSimple(.sequence_end, .{});
                                         return;
                                     } else if (nn.kind == .mapping_entry and nn.indent >= parent_indent) {
-                                        try self.events.append(self.allocator, .{
+                                        try self.emitEvent( .{
                                             .kind = .mapping_start,
                                             .data = .{ .mapping_start = .{
                                                 .style = .block,
@@ -749,7 +834,7 @@ fn emitSingleMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_inden
                                     self.scanned.lines.items[following].kind != .mapping_entry;
                                 if (sole_entry) {
                                     self.index += 1;
-                                    try self.events.append(self.allocator, .{
+                                    try self.emitEvent( .{
                                         .kind = .alias,
                                         .data = .{ .alias = .{ .name = try self.allocator.dupe(u8, alias_name), .span = next.span } },
                                     });
@@ -762,7 +847,7 @@ fn emitSingleMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_inden
                 }
             } else if (next.indent == parent_indent and next.kind == .sequence_item) {
                 if (maybe_anchor) |anch| {
-                    try self.events.append(self.allocator, .{
+                    try self.emitEvent( .{
                         .kind = .sequence_start,
                         .data = .{ .sequence_start = .{
                             .style = .block,
@@ -788,20 +873,19 @@ fn emitSingleMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_inden
                     try self.parseBlockSequence(parent_indent);
                 }
             } else {
+                try self.prepareScalarTag(canonicalTag(line.value));
                 try self.pushScalar("", .plain, maybe_anchor, line.span);
-                try self.tagLastScalar(canonicalTag(line.value));
             }
         } else {
+            try self.prepareScalarTag(canonicalTag(line.value));
             try self.pushScalar("", .plain, maybe_anchor, line.span);
-            try self.tagLastScalar(canonicalTag(line.value));
         }
         return;
     }
 
     if (line.style == .literal or line.style == .folded) {
         const block = try self.collectBlockScalar(line.indent, line.style, line.value, line.line_no);
-        defer self.allocator.free(block);
-        try self.pushScalar(block, line.style, null, line.span);
+        try self.pushScalarOwned(block, line.style, null, line.span);
         return;
     }
 
@@ -813,8 +897,7 @@ fn emitSingleMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_inden
         if (trimmed_after.len > 0 and (trimmed_after[0] == '|' or trimmed_after[0] == '>')) {
             const bs_style: Token.ScalarStyle = if (trimmed_after[0] == '|') .literal else .folded;
             const block = try self.collectBlockScalar(line.indent, bs_style, trimmed_after, line.line_no);
-            defer self.allocator.free(block);
-            try self.pushScalar(block, bs_style, null, line.span);
+            try self.pushScalarOwned(block, bs_style, null, line.span);
             return;
         }
     }
@@ -881,11 +964,23 @@ fn emitExplicitMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_ind
         }
     } else {
         const key_text = try self.collectExplicitKey(line, parent_indent);
-        defer self.allocator.free(key_text);
         const key_style = line.key_style;
-        const normalized_key = try normalizeScalar(self.allocator, key_text, if (key_style == .literal or key_style == .folded) .plain else key_style);
-        defer self.allocator.free(normalized_key);
-        try self.pushScalar(normalized_key, key_style, null, line.span);
+        if (key_style == .literal or key_style == .folded) {
+            try self.pushScalarOwned(key_text, key_style, null, line.span);
+        } else {
+            defer self.allocator.free(key_text);
+            if (key_style == .plain) {
+                const trimmed = std.mem.trim(u8, key_text, " \t");
+                if (trimmed.len == 0 or isSubslice(self.scanned.source, trimmed)) {
+                    try self.pushScalar(trimmed, key_style, null, line.span);
+                } else {
+                    const owned_key = try self.scalar_allocator.dupe(u8, trimmed);
+                    try self.pushScalarOwned(owned_key, key_style, null, line.span);
+                }
+            } else {
+                try self.pushScalarNormalized(key_text, key_style, null, line.span);
+            }
+        }
     }
 
     if (self.index >= self.scanned.lines.items.len) {
@@ -907,8 +1002,7 @@ fn emitExplicitMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_ind
     if (value_style == .literal or value_style == .folded) {
         self.index -= 1;
         const block = try self.collectBlockScalar(parent_indent, value_style, value_text, value_line_no);
-        defer self.allocator.free(block);
-        try self.pushScalar(block, value_style, null, value_span);
+        try self.pushScalarOwned(block, value_style, null, value_span);
         return;
     }
 
@@ -919,6 +1013,7 @@ fn emitExplicitMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_ind
     }
     if (trimmed.len > 0 and (trimmed[0] == '[' or trimmed[0] == '{')) {
         try self.parseFlow(trimmed, value_line_no, parent_indent);
+        try self.commitFlowScratch();
         return;
     }
     if (trimmed.len == 0) {
@@ -982,7 +1077,7 @@ fn emitCompactSequence(self: *Parser, parent_indent: usize, first: []const u8, s
         const nxt = self.scanned.lines.items[self.index];
         if (nxt.kind == .sequence_item and nxt.indent > parent_indent) nested_indent = nxt.indent;
     }
-    try self.events.append(self.allocator, .{
+    try self.emitEvent( .{
         .kind = .sequence_start,
         .data = .{ .sequence_start = .{ .style = .block } },
     });
@@ -1041,12 +1136,18 @@ fn collectBlockScalar(
     var has_content = false;
     var leading_spaces: usize = 0;
     var in_leading = base_indent == null;
+    var est: usize = 0;
+    // Track sole content line for `|-` single-line fast path (CRD descriptions).
+    var sole_content: ?[]const u8 = null;
+    var sole_content_ri: usize = 0;
+    var content_lines: usize = 0;
+    var leading_blanks: usize = 0;
 
     {
         var ri = header_line_no + 1;
         while (ri < raw_lines.len) : (ri += 1) {
-            const rline = raw_lines[ri];
-            const li = countSpaces(rline);
+            const rline = raw_lines[ri].text;
+            const li = raw_lines[ri].spaces;
             const is_blank = (li >= rline.len);
 
             // A document marker at column 0 ends the scalar. An indented "..." is content.
@@ -1060,6 +1161,7 @@ fn collectBlockScalar(
 
             if (is_blank) {
                 if (in_leading and li > leading_spaces) leading_spaces = li;
+                if (!has_content) leading_blanks += 1;
                 block_end = ri + 1;
                 continue;
             }
@@ -1076,6 +1178,13 @@ fn collectBlockScalar(
 
             has_content = true;
             block_end = ri + 1;
+            content_lines += 1;
+            const content = if (rline.len > base_indent.?) rline[base_indent.?..] else rline[rline.len..];
+            if (content_lines == 1) {
+                sole_content = content;
+                sole_content_ri = ri;
+            } else sole_content = null;
+            if (rline.len > base_indent.?) est += rline.len - base_indent.? + 1 else est += 1;
         }
     }
 
@@ -1088,81 +1197,81 @@ fn collectBlockScalar(
 
     const bi = base_indent orelse (parent_indent + 1);
 
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    defer out.deinit(self.allocator);
+    // `|-` with exactly one content line and nothing after it (no trailing blanks that
+    // strip would still partially keep when more-indented). Leading blanks disallowed.
+    if (style == .literal and chomp == .strip and content_lines == 1 and leading_blanks == 0 and
+        block_end == sole_content_ri + 1)
+    {
+        if (sole_content) |content| return try self.scalar_allocator.dupe(u8, content);
+    }
 
     if (style == .literal) {
-        var ri = header_line_no + 1;
-        while (ri < block_end) : (ri += 1) {
-            const rline = raw_lines[ri];
-            const li = countSpaces(rline);
-
-            if (li >= rline.len) {
-                if (has_content and li > bi) {
-                    try out.appendSlice(self.allocator, rline[bi..]);
-                    try out.append(self.allocator, '\n');
-                } else {
-                    try out.append(self.allocator, '\n');
-                }
-            } else if (li >= bi) {
-                try out.appendSlice(self.allocator, rline[bi..]);
-                try out.append(self.allocator, '\n');
-            } else {
-                try out.append(self.allocator, '\n');
-            }
-        }
-    } else {
-        // Folded: accumulate blank lines and emit correct newline counts
-        var blank_count: usize = 0;
-        var first_content = true;
-        var prev_was_more = false;
-
-        var ri = header_line_no + 1;
-        while (ri < block_end) : (ri += 1) {
-            const rline = raw_lines[ri];
-            const li = countSpaces(rline);
-            const is_blank = (li >= rline.len);
-
-            if (is_blank) {
-                blank_count += 1;
-                continue;
-            }
-
-            if (li < bi) break;
-
-            // A tab is not indentation, so a line whose content starts with a tab is
-            // more-indented and is not folded into the previous line.
-            const more_indented = li > bi or (li < rline.len and rline[li] == '\t');
-            const content = rline[bi..];
-
-            if (first_content) {
-                var b: usize = 0;
-                while (b < blank_count) : (b += 1) try out.append(self.allocator, '\n');
-            } else {
-                if (blank_count > 0) {
-                    const extra: usize = if (prev_was_more or more_indented) 1 else 0;
-                    var b: usize = 0;
-                    while (b < blank_count + extra) : (b += 1) try out.append(self.allocator, '\n');
-                } else if (prev_was_more or more_indented) {
-                    try out.append(self.allocator, '\n');
-                } else {
-                    try out.append(self.allocator, ' ');
-                }
-            }
-
-            try out.appendSlice(self.allocator, content);
-            blank_count = 0;
-            prev_was_more = more_indented;
-            first_content = false;
-        }
-
-        // Trailing blank lines for keep chomping
-        if (!first_content) {
-            try out.append(self.allocator, '\n');
-        }
-        var b: usize = 0;
-        while (b < blank_count) : (b += 1) try out.append(self.allocator, '\n');
+        return try collectLiteralBlock(
+            self.scalar_allocator,
+            raw_lines,
+            header_line_no + 1,
+            block_end,
+            bi,
+            has_content,
+            chomp,
+            est,
+        );
     }
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(self.scalar_allocator);
+    try out.ensureTotalCapacity(self.scalar_allocator, est + 8);
+
+    // Folded: accumulate blank lines and emit correct newline counts
+    var blank_count: usize = 0;
+    var first_content = true;
+    var prev_was_more = false;
+
+    var ri = header_line_no + 1;
+    while (ri < block_end) : (ri += 1) {
+        const rline = raw_lines[ri].text;
+        const li = raw_lines[ri].spaces;
+        const is_blank = (li >= rline.len);
+
+        if (is_blank) {
+            blank_count += 1;
+            continue;
+        }
+
+        if (li < bi) break;
+
+        // A tab is not indentation, so a line whose content starts with a tab is
+        // more-indented and is not folded into the previous line.
+        const more_indented = li > bi or (li < rline.len and rline[li] == '\t');
+        const content = rline[bi..];
+
+        if (first_content) {
+            var b: usize = 0;
+            while (b < blank_count) : (b += 1) try out.append(self.scalar_allocator, '\n');
+        } else {
+            if (blank_count > 0) {
+                const extra: usize = if (prev_was_more or more_indented) 1 else 0;
+                var b: usize = 0;
+                while (b < blank_count + extra) : (b += 1) try out.append(self.scalar_allocator, '\n');
+            } else if (prev_was_more or more_indented) {
+                try out.append(self.scalar_allocator, '\n');
+            } else {
+                try out.append(self.scalar_allocator, ' ');
+            }
+        }
+
+        try out.appendSlice(self.scalar_allocator, content);
+        blank_count = 0;
+        prev_was_more = more_indented;
+        first_content = false;
+    }
+
+    // Trailing blank lines for keep chomping
+    if (!first_content) {
+        try out.append(self.scalar_allocator, '\n');
+    }
+    var b: usize = 0;
+    while (b < blank_count) : (b += 1) try out.append(self.scalar_allocator, '\n');
 
     // Apply chomping
     switch (chomp) {
@@ -1175,12 +1284,73 @@ fn collectBlockScalar(
             while (out.items.len > 0 and out.items[out.items.len - 1] == '\n') {
                 _ = out.pop();
             }
-            if (has_content) try out.append(self.allocator, '\n');
+            if (has_content) try out.append(self.scalar_allocator, '\n');
         },
         .keep => {},
     }
 
-    return out.toOwnedSlice(self.allocator);
+    return out.toOwnedSlice(self.scalar_allocator);
+}
+
+/// Literal `|` / `|-` / `|+` body → owned buffer (no ArrayList churn).
+/// Hot path for CRD `description: |-` blocks (~6k in prometheus-operator bundle).
+fn collectLiteralBlock(
+    allocator: std.mem.Allocator,
+    raw_lines: []const Scanner.PhysicalLine,
+    start: usize,
+    block_end: usize,
+    bi: usize,
+    has_content: bool,
+    chomp: ChompMode,
+    est: usize,
+) ![]u8 {
+    var buf = try allocator.alloc(u8, est + 8);
+    errdefer allocator.free(buf);
+    var len: usize = 0;
+
+    var ri = start;
+    while (ri < block_end) : (ri += 1) {
+        const rline = raw_lines[ri].text;
+        const li = raw_lines[ri].spaces;
+
+        if (li >= rline.len) {
+            if (has_content and li > bi) {
+                const slice = rline[bi..];
+                @memcpy(buf[len .. len + slice.len], slice);
+                len += slice.len;
+                buf[len] = '\n';
+                len += 1;
+            } else {
+                buf[len] = '\n';
+                len += 1;
+            }
+        } else if (li >= bi) {
+            const slice = rline[bi..];
+            @memcpy(buf[len .. len + slice.len], slice);
+            len += slice.len;
+            buf[len] = '\n';
+            len += 1;
+        } else {
+            buf[len] = '\n';
+            len += 1;
+        }
+    }
+
+    switch (chomp) {
+        .strip => {
+            while (len > 0 and buf[len - 1] == '\n') len -= 1;
+        },
+        .clip => {
+            while (len > 0 and buf[len - 1] == '\n') len -= 1;
+            if (has_content) {
+                buf[len] = '\n';
+                len += 1;
+            }
+        },
+        .keep => {},
+    }
+
+    return buf[0..len];
 }
 
 fn parseScalarLikeValue(
@@ -1207,8 +1377,8 @@ fn parseScalarLikeValue(
 
     if (std.mem.eql(u8, std.mem.trim(u8, working, " \t"), "!")) working = "";
     if (working.len == 0) {
+        try self.prepareScalarTag(canonicalTag(value));
         try self.pushScalar("", .plain, anchor_name, .{});
-        try self.tagLastScalar(canonicalTag(value));
         return;
     }
 
@@ -1219,7 +1389,7 @@ fn parseScalarLikeValue(
         const alias_name = working[1..end];
         const rest = std.mem.trim(u8, working[end..], " \t");
         if (alias_name.len == 0 or rest.len != 0) return Error.Parse.InvalidAlias;
-        try self.events.append(self.allocator, .{
+        try self.emitEvent( .{
             .kind = .alias,
             .data = .{ .alias = .{ .name = try self.allocator.dupe(u8, alias_name), .span = .{} } },
         });
@@ -1227,11 +1397,15 @@ fn parseScalarLikeValue(
     }
 
     if (working[0] == '[' or working[0] == '{') {
-        const pre_flow_count = self.events.items.len;
+        const pre_flow_count = if (self.stream != null)
+            self.flow_scratch.items.len
+        else
+            self.events.items.len;
         try self.parseFlow(working, line_no, col);
         if (anchor_name) |aname| {
-            if (self.events.items.len > pre_flow_count) {
-                const first = &self.events.items[pre_flow_count];
+            const list = if (self.stream != null) &self.flow_scratch else &self.events;
+            if (list.items.len > pre_flow_count) {
+                const first = &list.items[pre_flow_count];
                 switch (first.kind) {
                     .sequence_start => first.data.sequence_start.anchor = try self.allocator.dupe(u8, aname),
                     .mapping_start => first.data.mapping_start.anchor = try self.allocator.dupe(u8, aname),
@@ -1239,6 +1413,7 @@ fn parseScalarLikeValue(
                 }
             }
         }
+        try self.commitFlowScratch();
         return;
     }
 
@@ -1247,7 +1422,7 @@ fn parseScalarLikeValue(
             const key = std.mem.trimEnd(u8, working[0..idx], " ");
             const raw_val = std.mem.trimStart(u8, working[idx + 1 ..], " ");
             if (key.len > 0) {
-                try self.events.append(self.allocator, .{
+                try self.emitEvent( .{
                     .kind = .mapping_start,
                     .data = .{ .mapping_start = .{ .style = .block } },
                 });
@@ -1260,10 +1435,8 @@ fn parseScalarLikeValue(
     }
 
     const final_style: Token.ScalarStyle = working_style;
-    const scalar = try normalizeScalar(self.allocator, working, final_style);
-    defer self.allocator.free(scalar);
-    try self.pushScalar(scalar, final_style, anchor_name, .{});
-    try self.tagLastScalar(canonicalTag(value));
+    try self.prepareScalarTag(canonicalTag(value));
+    try self.pushScalarNormalized(working, final_style, anchor_name, .{});
 }
 
 fn detectInlineStyle(value: []const u8) Token.ScalarStyle {
@@ -1276,6 +1449,12 @@ fn detectInlineStyle(value: []const u8) Token.ScalarStyle {
 }
 
 fn parseFlow(self: *Parser, text: []const u8, line_no: usize, col: usize) anyerror!void {
+    const saved_sink = self.emit_sink;
+    if (self.stream != null) self.emit_sink = .flow_scratch;
+    defer {
+        if (self.stream != null) self.emit_sink = saved_sink;
+    }
+
     var folded: std.ArrayListUnmanaged([]u8) = .empty;
     defer {
         for (folded.items) |buf| self.allocator.free(buf);
@@ -1284,12 +1463,12 @@ fn parseFlow(self: *Parser, text: []const u8, line_no: usize, col: usize) anyerr
     const tokens = try Scanner.tokenizeFlow(self.allocator, text, line_no, col, &folded);
     defer self.allocator.free(tokens);
     var cursor: usize = 0;
-    const at = self.events.items.len;
+    const at = self.activeEventList().items.len;
     try self.parseFlowValue(tokens, &cursor);
     // `[]: x` in block context is a mapping whose key is the flow node.
     if (cursor < tokens.len and tokens[cursor].kind == .colon) {
         if (tokens[cursor].indent != 0) return Error.Parse.UnexpectedToken;
-        try self.events.insert(self.allocator, at, .{
+        try self.eventInsert(at, .{
             .kind = .mapping_start,
             .data = .{ .mapping_start = .{ .style = .block } },
         });
@@ -1310,7 +1489,9 @@ fn parseFlowPairValue(self: *Parser, tokens: []const Token.Token, cursor: *usize
 
 fn noteFlowAnchor(self: *Parser, anchor: []const u8) !void {
     if (anchor.len == 0) return;
-    const ev = &self.events.items[self.events.items.len - 1];
+    const list = self.activeEventList();
+    if (list.items.len == 0) return;
+    const ev = &list.items[list.items.len - 1];
     const name = try self.allocator.dupe(u8, anchor);
     switch (ev.kind) {
         .sequence_start => ev.data.sequence_start.anchor = name,
@@ -1325,14 +1506,14 @@ fn parseFlowValue(self: *Parser, tokens: []const Token.Token, cursor: *usize) an
     switch (tok.kind) {
         .lbracket => {
             cursor.* += 1;
-            try self.events.append(self.allocator, .{
+            try self.emitEvent( .{
                 .kind = .sequence_start,
                 .data = .{ .sequence_start = .{ .style = .flow } },
             });
             try self.noteFlowAnchor(tok.anchor);
             while (cursor.* < tokens.len and tokens[cursor.*].kind != .rbracket and tokens[cursor.*].kind != .eof) {
                 // `key: value` inside a flow sequence is a single-entry mapping.
-                const entry_at = self.events.items.len;
+                const entry_at = self.activeEventList().items.len;
                 if (tokens[cursor.*].kind == .colon) {
                     if (tokens[cursor.*].indent != 0) return Error.Parse.UnexpectedToken;
                     try self.pushScalar("", .plain, null, tokens[cursor.*].span);
@@ -1341,7 +1522,7 @@ fn parseFlowValue(self: *Parser, tokens: []const Token.Token, cursor: *usize) an
                 }
                 if (cursor.* < tokens.len and tokens[cursor.*].kind == .colon) {
                     if (tokens[cursor.*].indent != 0) return Error.Parse.UnexpectedToken;
-                    try self.events.insert(self.allocator, entry_at, .{
+                    try self.eventInsert(entry_at, .{
                         .kind = .mapping_start,
                         .data = .{ .mapping_start = .{ .style = .flow } },
                     });
@@ -1361,7 +1542,7 @@ fn parseFlowValue(self: *Parser, tokens: []const Token.Token, cursor: *usize) an
         },
         .lbrace => {
             cursor.* += 1;
-            try self.events.append(self.allocator, .{
+            try self.emitEvent( .{
                 .kind = .mapping_start,
                 .data = .{ .mapping_start = .{ .style = .flow } },
             });
@@ -1373,7 +1554,7 @@ fn parseFlowValue(self: *Parser, tokens: []const Token.Token, cursor: *usize) an
                     cursor.* += 1;
                     try self.parseFlowPairValue(tokens, cursor, key.span);
                 } else if (key.kind == .alias) {
-                    try self.events.append(self.allocator, .{
+                    try self.emitEvent( .{
                         .kind = .alias,
                         .data = .{ .alias = .{ .name = try self.allocator.dupe(u8, key.lexeme), .span = key.span } },
                     });
@@ -1393,10 +1574,8 @@ fn parseFlowValue(self: *Parser, tokens: []const Token.Token, cursor: *usize) an
                         try self.pushScalar("", .plain, null, key.span);
                     }
                 } else if (key.kind == .scalar) {
-                    const norm_key = try normalizeScalar(self.allocator, key.lexeme, key.scalar_style);
-                    defer self.allocator.free(norm_key);
                     const flow_anchor: ?[]const u8 = if (key.anchor.len > 0) key.anchor else null;
-                    try self.pushScalar(norm_key, key.scalar_style, flow_anchor, key.span);
+                    try self.pushScalarNormalized(key.lexeme, key.scalar_style, flow_anchor, key.span);
                     cursor.* += 1;
                     if (cursor.* >= tokens.len) return Error.Parse.UnexpectedToken;
                     if (tokens[cursor.*].kind == .colon) {
@@ -1418,17 +1597,15 @@ fn parseFlowValue(self: *Parser, tokens: []const Token.Token, cursor: *usize) an
             try self.pushSimple(.mapping_end, tok.span);
         },
         .alias => {
-            try self.events.append(self.allocator, .{
+            try self.emitEvent( .{
                 .kind = .alias,
                 .data = .{ .alias = .{ .name = try self.allocator.dupe(u8, tok.lexeme), .span = tok.span } },
             });
             cursor.* += 1;
         },
         .scalar => {
-            const normalized = try normalizeScalar(self.allocator, tok.lexeme, tok.scalar_style);
-            defer self.allocator.free(normalized);
             const flow_anchor: ?[]const u8 = if (tok.anchor.len > 0) tok.anchor else null;
-            try self.pushScalar(normalized, tok.scalar_style, flow_anchor, tok.span);
+            try self.pushScalarNormalized(tok.lexeme, tok.scalar_style, flow_anchor, tok.span);
             cursor.* += 1;
         },
         .eof => {},
@@ -1440,8 +1617,12 @@ fn normalizeScalar(allocator: std.mem.Allocator, raw: []const u8, style: Token.S
     switch (style) {
         .single_quoted => {
             const inner = stripOuterQuotes(raw, '\'');
+            if (std.mem.indexOf(u8, inner, "''") == null) {
+                return allocator.dupe(u8, inner);
+            }
             var out: std.ArrayListUnmanaged(u8) = .empty;
             defer out.deinit(allocator);
+            try out.ensureTotalCapacity(allocator, inner.len);
             var i: usize = 0;
             while (i < inner.len) : (i += 1) {
                 if (inner[i] == '\'' and i + 1 < inner.len and inner[i + 1] == '\'') {
@@ -1455,10 +1636,14 @@ fn normalizeScalar(allocator: std.mem.Allocator, raw: []const u8, style: Token.S
         },
         .double_quoted => {
             const inner = stripOuterQuotes(raw, '"');
+            if (std.mem.indexOfScalar(u8, inner, '\\') == null) {
+                return allocator.dupe(u8, inner);
+            }
             var out: std.ArrayListUnmanaged(u8) = .empty;
             defer out.deinit(allocator);
+            try out.ensureTotalCapacity(allocator, inner.len);
             var i: usize = 0;
-            while (i < inner.len) : (i += 1) {
+            while (i < inner.len) {
                 if (inner[i] == '\\' and i + 1 < inner.len) {
                     i += 1;
                     switch (inner[i]) {
@@ -1498,8 +1683,12 @@ fn normalizeScalar(allocator: std.mem.Allocator, raw: []const u8, style: Token.S
                         'P' => try out.appendSlice(allocator, "\xE2\x80\xA9"),
                         else => return Error.Parse.InvalidEscapeSequence,
                     }
+                    i += 1;
                 } else {
-                    try out.append(allocator, inner[i]);
+                    const start = i;
+                    i += 1;
+                    while (i < inner.len and inner[i] != '\\') : (i += 1) {}
+                    try out.appendSlice(allocator, inner[start..i]);
                 }
             }
             return out.toOwnedSlice(allocator);
@@ -1857,12 +2046,8 @@ fn canonicalTag(raw: []const u8) ?[]const u8 {
     return null;
 }
 
-fn tagLastScalar(self: *Parser, tag: ?[]const u8) !void {
-    const text = tag orelse return;
-    if (self.events.items.len == 0) return;
-    const ev = &self.events.items[self.events.items.len - 1];
-    if (ev.kind != .scalar or ev.data.scalar.tag != null) return;
-    ev.data.scalar.tag = try self.allocator.dupe(u8, text);
+fn prepareScalarTag(self: *Parser, tag: ?[]const u8) !void {
+    if (tag) |t| self.pending_scalar_tag = t;
 }
 
 fn looksLikeStructure(content: []const u8) bool {
@@ -1891,7 +2076,7 @@ fn isSpace(c: u8) bool {
 }
 
 fn pushDocumentStart(self: *Parser, explicit: bool) anyerror!void {
-    try self.events.append(self.allocator, .{
+    try self.emitEvent(.{
         .kind = .document_start,
         .data = .{ .document_start = .{ .explicit = explicit } },
     });
@@ -1904,7 +2089,7 @@ fn pushScalar(self: *Parser, value: []const u8, style: Token.ScalarStyle, anchor
     const stored: []const u8 = if (borrow) value else try self.allocator.dupe(u8, value);
     errdefer if (!borrow) self.allocator.free(stored);
 
-    try self.events.append(self.allocator, .{
+    try self.emitEvent(.{
         .kind = .scalar,
         .data = .{ .scalar = .{
             .value = stored,
@@ -1916,6 +2101,72 @@ fn pushScalar(self: *Parser, value: []const u8, style: Token.ScalarStyle, anchor
     });
 }
 
+/// Push a GPA-allocated scalar buffer; ownership transfers to the event stream.
+fn pushScalarOwned(self: *Parser, value: []const u8, style: Token.ScalarStyle, anchor: ?[]const u8, span: @import("Span.zig")) anyerror!void {
+    try self.emitEvent(.{
+        .kind = .scalar,
+        .data = .{ .scalar = .{
+            .value = value,
+            .style = style,
+            .anchor = if (anchor) |a| try self.allocator.dupe(u8, a) else null,
+            .span = span,
+            .value_owned = value.len > 0,
+            .pool_backed = value.len > 0 and self.scalar_pool_backed,
+        } },
+    });
+}
+
+/// Normalize then push, skipping the GPA copy for plain scalars that already
+/// live as trimmed subslices of `scanned.source` (the CRD / bundle hot path).
+fn pushScalarNormalized(
+    self: *Parser,
+    raw: []const u8,
+    style: Token.ScalarStyle,
+    anchor: ?[]const u8,
+    span: @import("Span.zig"),
+) anyerror!void {
+    if (style == .plain) {
+        const trimmed = std.mem.trim(u8, raw, " \t");
+        if (trimmed.len == 0) {
+            try self.pushScalar("", .plain, anchor, span);
+            return;
+        }
+        if (isSubslice(self.scanned.source, trimmed)) {
+            try self.pushScalar(trimmed, .plain, anchor, span);
+            return;
+        }
+        const owned = try self.scalar_allocator.dupe(u8, trimmed);
+        try self.pushScalarOwned(owned, .plain, anchor, span);
+        return;
+    }
+    if (style == .single_quoted) {
+        const inner = stripOuterQuotes(raw, '\'');
+        if (std.mem.indexOf(u8, inner, "''") == null) {
+            if (isSubslice(self.scanned.source, inner)) {
+                try self.pushScalar(inner, style, anchor, span);
+            } else {
+                const owned = try self.scalar_allocator.dupe(u8, inner);
+                try self.pushScalarOwned(owned, style, anchor, span);
+            }
+            return;
+        }
+    }
+    if (style == .double_quoted) {
+        const inner = stripOuterQuotes(raw, '"');
+        if (std.mem.indexOfScalar(u8, inner, '\\') == null) {
+            if (isSubslice(self.scanned.source, inner)) {
+                try self.pushScalar(inner, style, anchor, span);
+            } else {
+                const owned = try self.scalar_allocator.dupe(u8, inner);
+                try self.pushScalarOwned(owned, style, anchor, span);
+            }
+            return;
+        }
+    }
+    const scalar = try normalizeScalar(self.scalar_allocator, raw, style);
+    try self.pushScalarOwned(scalar, style, anchor, span);
+}
+
 fn isSubslice(haystack: []const u8, needle: []const u8) bool {
     if (needle.len == 0) return true;
     const n_start = @intFromPtr(needle.ptr);
@@ -1925,7 +2176,7 @@ fn isSubslice(haystack: []const u8, needle: []const u8) bool {
 }
 
 fn pushSimple(self: *Parser, kind: EventModel.Kind, span: @import("Span.zig")) anyerror!void {
-    try self.events.append(self.allocator, .{
+    try self.emitEvent(.{
         .kind = kind,
         .data = switch (kind) {
             .stream_start => .{ .stream_start = span },

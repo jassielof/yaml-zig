@@ -7,9 +7,10 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const sierra_mod = b.dependency("sierra", .{
+    // Bench uses a dedicated ReleaseFast Sierra module so CI never reports Debug.
+    const sierra_bench_mod = b.dependency("sierra", .{
         .target = target,
-        .optimize = optimize,
+        .optimize = .ReleaseFast,
     }).module("sierra");
 
     const summary_only = b.option(bool, "summary", "Only print short coverage summary (useful for CI)") orelse false;
@@ -74,7 +75,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(spec_tests).step);
 
     // Bench always uses ReleaseFast for timed artifacts so Debug defaults do
-    // not poison throughput. Sierra is imported from the scz Git submodule.
+    // not poison throughput. libfyaml is kept as the permanent comparison rival.
     const bench_fy = fy.create(b, .{
         .module_name = "fy_bench",
         .target = target,
@@ -95,7 +96,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "yaml", .module = yaml_bench_mod },
             .{ .name = "fy", .module = bench_fy.module },
-            .{ .name = "sierra", .module = sierra_mod },
+            .{ .name = "sierra", .module = sierra_bench_mod },
         },
     });
     bench_fy.link(bench_root);
@@ -103,7 +104,7 @@ pub fn build(b: *std.Build) void {
     const bench_exe = sierra_build.addBenchmarkExecutable(b, .{
         .name = "bench-parse",
         .root_module = bench_root,
-        .sierra_module = sierra_mod,
+        .sierra_module = sierra_bench_mod,
         .optimize = .ReleaseFast,
         .target = target,
     });

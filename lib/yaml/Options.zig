@@ -17,6 +17,10 @@ pub const Parse = struct {
     ///
     /// Quoted scalars remain strings regardless of this flag.
     resolve_core_schema: bool = true,
+    /// When true (default), a copy of the input is pinned for borrowed plain scalars
+    /// so the caller may free `source` after parsing. When false, string nodes may
+    /// point into `source`; it must outlive every returned `Document`.
+    retain_input: bool = true,
 };
 
 /// Stringify-time formatting options.

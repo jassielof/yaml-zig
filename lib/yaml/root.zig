@@ -33,7 +33,7 @@ pub fn parseDocument(
     const docs = try parseStream(allocator, source, options);
     defer allocator.free(docs);
     if (docs.len == 0) {
-        return Document.init(allocator, std.heap.ArenaAllocator.init(allocator), .null);
+        return Document.init(allocator, std.heap.ArenaAllocator.init(allocator), .null, null, null);
     }
     if (docs.len != 1) {
         for (docs) |*doc| doc.deinit();
@@ -92,11 +92,17 @@ pub fn parseStream(
     defer scanner.deinit();
     const scanned = try scanner.scan();
 
-    var parser = Parser.init(allocator, scanned, options);
-    defer parser.deinit();
-    const events = try parser.parse();
+    const scalar_pool = try Document.OwnedScalarPool.create(allocator);
+    errdefer scalar_pool.release();
 
-    return Composer.composeStream(allocator, events, options);
+    var stream = Composer.Stream.init(allocator, options, scanned.source, scalar_pool);
+    errdefer stream.deinit();
+
+    var parser = Parser.initWithScalarPool(allocator, scanned, options, scalar_pool, &stream);
+    defer parser.deinit();
+    try parser.parseComposed();
+
+    return stream.finish(allocator);
 }
 
 /// Parse YAML into a flat event stream (SAX-style).

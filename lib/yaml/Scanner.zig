@@ -39,11 +39,17 @@ pub const ScannedLine = struct {
     started_explicit: bool = false,
 };
 
+pub const PhysicalLine = struct {
+    text: []const u8,
+    /// Leading ASCII space count (`CharClass.countLeadingSpaces(text)`).
+    spaces: usize,
+};
+
 pub const ScannedDocument = struct {
     source: []const u8,
     lines: std.ArrayListUnmanaged(ScannedLine),
     /// Physical source lines (CR-stripped). Shared with the parser for block scalars.
-    physical: std.ArrayListUnmanaged([]const u8) = .empty,
+    physical: std.ArrayListUnmanaged(PhysicalLine) = .empty,
     /// Buffers for values joined across physical lines (multiline flow).
     owned: std.ArrayListUnmanaged([]u8) = .empty,
 
@@ -77,16 +83,10 @@ pub fn deinit(self: *Scanner) void {
 }
 
 pub fn scan(self: *Scanner) !ScannedDocument {
-    var physical: std.ArrayListUnmanaged([]const u8) = .empty;
+    var physical = try buildPhysicalLines(self.allocator, self.source);
     errdefer physical.deinit(self.allocator);
-    var split = std.mem.splitScalar(u8, self.source, '\n');
-    while (split.next()) |raw_line| {
-        try physical.append(self.allocator, stripCarriageReturn(raw_line));
-    }
-    // Match Parser.ensureRawLines: a trailing empty split entry is not a line.
-    if (physical.items.len > 0 and physical.items[physical.items.len - 1].len == 0) {
-        _ = physical.pop();
-    }
+
+    try self.lines.ensureTotalCapacity(self.allocator, physical.items.len);
 
     var owned: std.ArrayListUnmanaged([]u8) = .empty;
     errdefer {
@@ -110,8 +110,15 @@ pub fn scan(self: *Scanner) !ScannedDocument {
     var block_scalar_indent: ?usize = null;
 
     while (line_no < physical.items.len) : (line_no += 1) {
-        const line = physical.items[line_no];
-        const indent = countIndent(line);
+        const pline = physical.items[line_no];
+        const line = pline.text;
+        const indent = pline.spaces;
+
+        // More-indented block scalar body: skip structure/comment work; keep block mode.
+        if (block_scalar_indent) |bi| {
+            if (indent > bi) continue;
+        }
+
         const raw_content = std.mem.trimStart(u8, line[indent..], " ");
         const line_ends_with_comment = hasInlineComment(raw_content);
         var content = stripInlineComment(raw_content);
@@ -120,10 +127,7 @@ pub fn scan(self: *Scanner) !ScannedDocument {
             continue;
         }
 
-        if (block_scalar_indent) |bi| {
-            if (indent > bi) continue;
-            block_scalar_indent = null;
-        }
+        if (block_scalar_indent) |_| block_scalar_indent = null;
 
         // Directives are recognized only before a document has content. A '%' line
         // after content is a plain scalar ("scalar\n%YAML 1.2").
@@ -585,6 +589,28 @@ fn stripCarriageReturn(line: []const u8) []const u8 {
     return line;
 }
 
+fn buildPhysicalLines(allocator: std.mem.Allocator, source: []const u8) !std.ArrayListUnmanaged(PhysicalLine) {
+    const CharClass = @import("CharClass.zig");
+    var physical: std.ArrayListUnmanaged(PhysicalLine) = .empty;
+    errdefer physical.deinit(allocator);
+
+    var line_start: usize = 0;
+    var i: usize = 0;
+    while (i <= source.len) : (i += 1) {
+        if (i != source.len and source[i] != '\n') continue;
+        const text = stripCarriageReturn(source[line_start..i]);
+        try physical.append(allocator, .{
+            .text = text,
+            .spaces = CharClass.countLeadingSpaces(text),
+        });
+        line_start = i + 1;
+    }
+    if (physical.items.len > 0 and physical.items[physical.items.len - 1].text.len == 0) {
+        _ = physical.pop();
+    }
+    return physical;
+}
+
 fn countIndent(line: []const u8) usize {
     return @import("CharClass.zig").countLeadingSpaces(line);
 }
@@ -994,7 +1020,7 @@ fn hasInlineComment(text: []const u8) bool {
 
 fn joinUnclosedFlow(
     allocator: std.mem.Allocator,
-    lines: []const []const u8,
+    lines: []const PhysicalLine,
     index: *usize,
     initial: []const u8,
     owned: *std.ArrayListUnmanaged([]u8),
@@ -1017,12 +1043,12 @@ fn joinUnclosedFlow(
 
     var i = index.* + 1;
     while (i < lines.len and flowUnclosed(buf.items)) : (i += 1) {
-        const cont = lines[i];
+        const cont = lines[i].text;
         const cont_text = std.mem.trim(u8, cont, " \t");
         if (cont_text.len != 0 and (isDocumentMarker(cont_text, "---") or isDocumentMarker(cont_text, "..."))) {
             return Error.Parse.UnexpectedToken;
         }
-        if (enforce_indent and cont_text.len != 0 and (countIndent(cont) < min_indent or tabBeforeColumn(cont, min_indent))) {
+        if (enforce_indent and cont_text.len != 0 and (lines[i].spaces < min_indent or tabBeforeColumn(cont, min_indent))) {
             return Error.Parse.InvalidIndentation;
         }
         try buf.append(allocator, '\n');
