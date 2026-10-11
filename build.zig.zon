@@ -4,8 +4,8 @@
     .fingerprint = 0xea31a984633d8c3f,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
-        .libfyaml = .{ .path = "modules/libfyaml" },
-        .sierra = .{ .path = "dependencies/sierra" },
+        .libfyaml = .{ .path = "modules/libfyaml", .lazy = true },
+        .sierra = .{ .path = "dependencies/sierra", .lazy = true },
     },
     .paths = .{
         "build.zig",
