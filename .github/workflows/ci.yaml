@@ -20,10 +20,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
         with:
-          submodules: true
+          submodules: recursive
 
       - name: Setup Zig
-        uses: jassielof/setup-zig@main
+        uses: jassielof/setup-zig@v1
 
       - name: Check
         run: zig build check --summary all
@@ -34,10 +34,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
         with:
-          submodules: true
+          submodules: recursive
 
       - name: Setup Zig
-        uses: jassielof/setup-zig@main
+        uses: jassielof/setup-zig@v1
 
       - name: Build
         run: zig build --summary all
@@ -64,10 +64,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
         with:
-          submodules: true
+          submodules: recursive
 
       - name: Setup Zig
-        uses: jassielof/setup-zig@main
+        uses: jassielof/setup-zig@v1
 
       - name: Test
         run: zig build test --summary all -Dsummary=true
@@ -86,10 +86,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
         with:
-          submodules: true
+          submodules: recursive
 
       - name: Setup Zig
-        uses: jassielof/setup-zig@main
+        uses: jassielof/setup-zig@v1
 
       - name: Download reference YAML
         run: |
@@ -98,7 +98,7 @@ jobs:
             https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/main/bundle.yaml
 
       - name: Bench
-        run: zig build bench --summary all -- zig-out/bench-data/bundle.yaml
+        run: zig build bench --summary all -- --time=500ms --warmup=100ms --seed=1 zig-out/bench-data/bundle.yaml
 
   pages:
     name: Deploy to GitHub Pages

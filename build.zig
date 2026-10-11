@@ -1,10 +1,16 @@
 const std = @import("std");
 
 const fy = @import("build/fy.zig");
+const sierra_build = @import("sierra");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+
+    const sierra_mod = b.dependency("sierra", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("sierra");
 
     const summary_only = b.option(bool, "summary", "Only print short coverage summary (useful for CI)") orelse false;
 
@@ -67,38 +73,44 @@ pub fn build(b: *std.Build) void {
     fy_dep.link(spec_tests.root_module);
     test_step.dependOn(&b.addRunArtifact(spec_tests).step);
 
-    // Bench always uses ReleaseFast for the timed artifacts so Debug CI/local
-    // defaults do not poison throughput numbers. Pass -Doptimize=ReleaseFast
-    // (or other) only if you also want the rest of the build graph in that mode.
+    // Bench always uses ReleaseFast for timed artifacts so Debug defaults do
+    // not poison throughput. Sierra is imported from the scz Git submodule.
     const bench_fy = fy.create(b, .{
         .module_name = "fy_bench",
         .target = target,
         .optimize = .ReleaseFast,
     });
-    const bench_exe = b.addExecutable(.{
-        .name = "bench-parse",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("bench/parse.zig"),
-            .target = target,
-            .optimize = .ReleaseFast,
-            .link_libc = true,
-            .imports = &.{
-                .{
-                    .name = "yaml",
-                    .module = b.createModule(.{
-                        .root_source_file = b.path("lib/yaml/root.zig"),
-                        .target = target,
-                        .optimize = .ReleaseFast,
-                    }),
-                },
-                .{ .name = "fy", .module = bench_fy.module },
-            },
-        }),
+
+    const yaml_bench_mod = b.createModule(.{
+        .root_source_file = b.path("lib/yaml/root.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
     });
-    bench_fy.link(bench_exe.root_module);
+
+    const bench_root = b.createModule(.{
+        .root_source_file = b.path("bench/parse.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "yaml", .module = yaml_bench_mod },
+            .{ .name = "fy", .module = bench_fy.module },
+            .{ .name = "sierra", .module = sierra_mod },
+        },
+    });
+    bench_fy.link(bench_root);
+
+    const bench_exe = sierra_build.addBenchmarkExecutable(b, .{
+        .name = "bench-parse",
+        .root_module = bench_root,
+        .sierra_module = sierra_mod,
+        .optimize = .ReleaseFast,
+        .target = target,
+    });
+
     const run_bench = b.addRunArtifact(bench_exe);
-    if (b.args) |args| run_bench.addArgs(args);
-    const bench_step = b.step("bench", "Benchmark pure Zig YAML against libfyaml (ReleaseFast)");
+    run_bench.addPassthruArgs();
+    const bench_step = b.step("bench", "Benchmark yaml-zig vs libfyaml with Sierra (ReleaseFast)");
     bench_step.dependOn(&run_bench.step);
 
     const coverage_summary = b.addExecutable(.{
@@ -115,7 +127,7 @@ pub fn build(b: *std.Build) void {
 
     const check_step = b.step("check", "Run code quality checks");
     const fmt = b.addFmt(.{ .check = true, .paths = &.{
-        "lib",
+        b.path("lib"),
     } });
     check_step.dependOn(&fmt.step);
 }

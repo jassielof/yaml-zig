@@ -2,12 +2,10 @@
     .name = .yaml,
     .version = "0.1.0",
     .fingerprint = 0xea31a984633d8c3f,
-    // TODO: update to zig 0.17.0
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
-        .libfyaml = .{
-            .path = "modules/libfyaml",
-        },
+        .libfyaml = .{ .path = "modules/libfyaml" },
+        .sierra = .{ .path = "dependencies/sierra" },
     },
     .paths = .{
         "build.zig",

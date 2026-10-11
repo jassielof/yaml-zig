@@ -50,11 +50,11 @@ pub fn fromNode(comptime T: type, allocator: std.mem.Allocator, node: Node) !T {
                 else => return error.UnexpectedToken,
             };
             var out: T = undefined;
-            inline for (info.fields) |field| {
-                if (findMap(map.items, field.name)) |child| {
-                    @field(out, field.name) = try fromNode(field.type, allocator, child.*);
-                } else if (field.defaultValue()) |default| {
-                    @field(out, field.name) = default;
+            inline for (info.field_names, info.field_types, info.field_attrs) |field_name, FieldType, field_attrs| {
+                if (findMap(map.items, field_name)) |child| {
+                    @field(out, field_name) = try fromNode(FieldType, allocator, child.*);
+                } else if (field_attrs.defaultValue(FieldType)) |default| {
+                    @field(out, field_name) = default;
                 } else {
                     return error.UnexpectedToken;
                 }
@@ -66,8 +66,8 @@ pub fn fromNode(comptime T: type, allocator: std.mem.Allocator, node: Node) !T {
                 .string => |v| v,
                 else => return error.UnexpectedToken,
             };
-            inline for (info.fields) |field| {
-                if (std.mem.eql(u8, field.name, s)) break :blk @field(T, field.name);
+            inline for (info.field_names) |field_name| {
+                if (std.mem.eql(u8, field_name, s)) break :blk @field(T, field_name);
             }
             return error.UnexpectedToken;
         },
@@ -114,10 +114,10 @@ pub fn toNode(allocator: std.mem.Allocator, value: anytype) !Node {
                 }
                 map.deinit(allocator);
             }
-            inline for (info.fields) |field| {
+            inline for (info.field_names) |field_name| {
                 try map.append(allocator, .{
-                    .key = try allocator.dupe(u8, field.name),
-                    .value = try toNode(allocator, @field(value, field.name)),
+                    .key = try allocator.dupe(u8, field_name),
+                    .value = try toNode(allocator, @field(value, field_name)),
                 });
             }
             break :blk .{ .mapping = map };

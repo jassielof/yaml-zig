@@ -3,7 +3,7 @@ const std = @import("std");
 
 /// Characters that end an unquoted plain scalar in block context (approx).
 pub const plain_stop: [256]bool = blk: {
-    var t: [256]bool = [_]bool{false} ** 256;
+    var t: [256]bool = @splat(false);
     t['\n'] = true;
     t['\r'] = true;
     t['#'] = true;
