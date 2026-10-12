@@ -44,7 +44,7 @@ pub fn composeStream(
     scan_source: []const u8,
     scalar_pool: ?*Document.OwnedScalarPool,
 ) ![]Document {
-    defer freeEvents(allocator, events);
+    defer freeEvents(allocator, events, scan_source);
 
     if (events.len < 2 or events[0].kind != .stream_start) return Error.Parse.UnexpectedToken;
 
@@ -76,9 +76,9 @@ pub fn composeStream(
         const pin = shared_pin.?;
         const pinned_source = pin.backing orelse pin.bytes;
 
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        errdefer _ = arena.deinit();
-        const a = arena.allocator();
+        var doc_storage = try Document.DocumentArena.init(allocator, scan_source.len);
+        errdefer doc_storage.deinit();
+        const a = doc_storage.allocator();
 
         // Anchor map and node memory both live in the document arena.
         var anchors: std.StringHashMapUnmanaged(Node) = .empty;
@@ -89,7 +89,7 @@ pub fn composeStream(
 
         pin.retain();
         if (scalar_pool) |pool| pool.retain();
-        docs.append(allocator, Document.init(allocator, arena, root, pin, scalar_pool)) catch |err| {
+        docs.append(allocator, Document.init(allocator, doc_storage, root, pin, scalar_pool)) catch |err| {
             pin.release();
             if (scalar_pool) |pool| pool.release();
             return err;
@@ -137,7 +137,7 @@ fn composeNode(
 
             if (events[event_index].data.scalar.anchor) |anchor_name| {
                 if (skip_anchor == null or !std.mem.eql(u8, anchor_name, skip_anchor.?)) {
-                    try putAnchor(allocator, anchors, anchor_name, resolved);
+                    try putAnchor(allocator, scan_source, anchors, anchor_name, resolved);
                 }
             }
 
@@ -155,16 +155,19 @@ fn composeNode(
             index.* += 1;
             const result: Node = .{ .sequence = seq };
             if (seq_anchor) |anchor_name| {
-                try putAnchor(allocator, anchors, anchor_name, result);
+                try putAnchor(allocator, scan_source, anchors, anchor_name, result);
             }
             return result;
         },
         .mapping_start => {
             const map_anchor = ev.data.mapping_start.anchor;
             index.* += 1;
-            // ArrayHashMap stores key slices once (StringHashMap `seen` duped every key).
-            var staging: std.array_hash_map.String(Node) = .empty;
-            errdefer staging.clearAndFree(allocator);
+            var entries: std.ArrayListUnmanaged(MapEntry) = .empty;
+            var dedup: MappingDedup = .{};
+            errdefer {
+                dedup.deinit(allocator);
+                entries.deinit(allocator);
+            }
 
             while (index.* < events.len and events[index.*].kind != .mapping_end) {
                 const key_ev = events[index.*];
@@ -189,22 +192,14 @@ fn composeNode(
                 const key_anchor = if (key_ev.kind == .scalar) key_ev.data.scalar.anchor else null;
                 const value = try composeNode(allocator, event_gpa, events, index, options, anchors, key_anchor, scan_source, pinned_source);
 
-                const gop = try staging.getOrPut(allocator, key);
-                if (gop.found_existing) {
-                    switch (options.duplicate_keys) {
-                        .reject => return Error.Parse.DuplicateKey,
-                        .keep_last => gop.value_ptr.* = value,
-                    }
-                    continue;
-                }
-                gop.value_ptr.* = value;
+                try insertMappingEntry(allocator, &entries, &dedup, options, key, value);
             }
             if (index.* >= events.len or events[index.*].kind != .mapping_end) return Error.Parse.UnexpectedToken;
             index.* += 1;
-            const map = try mappingFromStaging(allocator, &staging);
-            const result: Node = .{ .mapping = map };
+            dedup.deinit(allocator);
+            const result: Node = .{ .mapping = entries };
             if (map_anchor) |anchor_name| {
-                try putAnchor(allocator, anchors, anchor_name, result);
+                try putAnchor(allocator, scan_source, anchors, anchor_name, result);
             }
             return result;
         },
@@ -243,7 +238,7 @@ fn composeMappingKey(
             pinned_source,
         );
         if (scalar.anchor) |anchor_name| {
-            try putAnchor(allocator, anchors, anchor_name, resolved_key);
+            try putAnchor(allocator, scan_source, anchors, anchor_name, resolved_key);
         }
         return mappingKeyBytes(allocator, resolved_key);
     }
@@ -259,7 +254,7 @@ fn composeMappingKey(
 
     if (scalar.anchor) |anchor_name| {
         const anchored: Node = .{ .string = @constCast(key_bytes) };
-        try putAnchor(allocator, anchors, anchor_name, anchored);
+        try putAnchor(allocator, scan_source, anchors, anchor_name, anchored);
     }
     return @constCast(key_bytes);
 }
@@ -321,27 +316,9 @@ fn isSubslice(haystack: []const u8, needle: []const u8) bool {
     return n_start >= h_start and n_start + needle.len <= h_end;
 }
 
-pub fn freeEvents(allocator: std.mem.Allocator, events: []Event) void {
+pub fn freeEvents(allocator: std.mem.Allocator, events: []Event, scan_source: []const u8) void {
     for (events) |ev| {
-        switch (ev.kind) {
-            .scalar => {
-                if (ev.data.scalar.value_owned and !ev.data.scalar.pool_backed) {
-                    allocator.free(ev.data.scalar.value);
-                }
-                if (ev.data.scalar.anchor) |anchor| allocator.free(anchor);
-                if (ev.data.scalar.tag) |tag| allocator.free(tag);
-            },
-            .alias => allocator.free(ev.data.alias.name),
-            .sequence_start => {
-                if (ev.data.sequence_start.anchor) |a| allocator.free(a);
-                if (ev.data.sequence_start.tag) |t| allocator.free(t);
-            },
-            .mapping_start => {
-                if (ev.data.mapping_start.anchor) |a| allocator.free(a);
-                if (ev.data.mapping_start.tag) |t| allocator.free(t);
-            },
-            else => {},
-        }
+        releaseOneEvent(allocator, scan_source, ev);
     }
     allocator.free(events);
 }
@@ -350,15 +327,87 @@ pub fn freeEvents(allocator: std.mem.Allocator, events: []Event) void {
 /// arena; clones happen on first alias use.
 fn putAnchor(
     allocator: std.mem.Allocator,
+    scan_source: []const u8,
     anchors: *std.StringHashMapUnmanaged(Node),
     name: []const u8,
     value: Node,
 ) !void {
     const gop = try anchors.getOrPut(allocator, name);
     if (!gop.found_existing) {
-        gop.key_ptr.* = try allocator.dupe(u8, name);
+        gop.key_ptr.* = try persistName(allocator, scan_source, name);
     }
     gop.value_ptr.* = value;
+}
+
+fn persistName(allocator: std.mem.Allocator, scan_source: []const u8, name: []const u8) ![]const u8 {
+    if (name.len == 0) return name;
+    if (isSubslice(scan_source, name)) return @constCast(name);
+    return try allocator.dupe(u8, name);
+}
+
+fn freeNameIfOwned(allocator: std.mem.Allocator, scan_source: []const u8, name: []const u8) void {
+    if (name.len == 0) return;
+    if (isSubslice(scan_source, name)) return;
+    allocator.free(name);
+}
+
+const MappingDedup = struct {
+    index: ?std.StringHashMapUnmanaged(usize) = null,
+
+    fn deinit(self: *MappingDedup, allocator: std.mem.Allocator) void {
+        if (self.index) |*map| {
+            map.deinit(allocator);
+            self.index = null;
+        }
+    }
+
+    fn ensureIndex(self: *MappingDedup, allocator: std.mem.Allocator, entries: []const MapEntry) !void {
+        if (self.index != null) return;
+        var map: std.StringHashMapUnmanaged(usize) = .empty;
+        try map.ensureTotalCapacity(allocator, @intCast(entries.len));
+        for (entries, 0..) |entry, i| {
+            try map.put(allocator, entry.key, i);
+        }
+        self.index = map;
+    }
+};
+
+fn insertMappingEntry(
+    allocator: std.mem.Allocator,
+    entries: *std.ArrayListUnmanaged(MapEntry),
+    dedup: *MappingDedup,
+    options: Options.Parse,
+    key: []const u8,
+    value: Node,
+) !void {
+    if (dedup.index) |*map| {
+        if (map.get(key)) |idx| {
+            switch (options.duplicate_keys) {
+                .reject => return Error.Parse.DuplicateKey,
+                .keep_last => {
+                    entries.items[idx].value = value;
+                    return;
+                },
+            }
+        }
+        const idx = entries.items.len;
+        try entries.append(allocator, .{ .key = @constCast(key), .value = value });
+        try map.put(allocator, key, idx);
+        return;
+    }
+
+    for (entries.items) |*entry| {
+        if (!std.mem.eql(u8, entry.key, key)) continue;
+        switch (options.duplicate_keys) {
+            .reject => return Error.Parse.DuplicateKey,
+            .keep_last => {
+                entry.value = value;
+                return;
+            },
+        }
+    }
+    try entries.append(allocator, .{ .key = @constCast(key), .value = value });
+    if (entries.items.len >= 16) try dedup.ensureIndex(allocator, entries.items);
 }
 
 fn resolveTaggedScalar(allocator: std.mem.Allocator, tag: []const u8, value: []const u8) !Node {
@@ -376,23 +425,6 @@ fn resolveTaggedScalar(allocator: std.mem.Allocator, tag: []const u8, value: []c
     return .{ .string = try allocator.dupe(u8, value) };
 }
 
-/// Move staged map entries into the `ArrayListUnmanaged(MapEntry)` node representation.
-fn mappingFromStaging(
-    allocator: std.mem.Allocator,
-    staging: *std.array_hash_map.String(Node),
-) !std.ArrayListUnmanaged(MapEntry) {
-    var map: std.ArrayListUnmanaged(MapEntry) = .empty;
-    errdefer map.deinit(allocator);
-    try map.ensureTotalCapacity(allocator, staging.count());
-    const keys = staging.keys();
-    const values = staging.values();
-    for (keys, values) |k, v| {
-        try map.append(allocator, .{ .key = @constCast(k), .value = v });
-    }
-    staging.clearAndFree(allocator);
-    return map;
-}
-
 /// Mapping lookup key bytes. Reuses string node storage when possible (Patch 3).
 fn mappingKeyBytes(allocator: std.mem.Allocator, node: Node) ![]u8 {
     return switch (node) {
@@ -405,22 +437,22 @@ fn mappingKeyBytes(allocator: std.mem.Allocator, node: Node) ![]u8 {
     };
 }
 
-fn releaseOneEvent(allocator: std.mem.Allocator, ev: Event) void {
+fn releaseOneEvent(allocator: std.mem.Allocator, scan_source: []const u8, ev: Event) void {
     switch (ev.kind) {
         .scalar => {
             if (ev.data.scalar.value_owned and !ev.data.scalar.pool_backed) {
                 allocator.free(ev.data.scalar.value);
             }
-            if (ev.data.scalar.anchor) |anchor| allocator.free(anchor);
+            if (ev.data.scalar.anchor) |anchor| freeNameIfOwned(allocator, scan_source, anchor);
             if (ev.data.scalar.tag) |tag| allocator.free(tag);
         },
-        .alias => allocator.free(ev.data.alias.name),
+        .alias => freeNameIfOwned(allocator, scan_source, ev.data.alias.name),
         .sequence_start => {
-            if (ev.data.sequence_start.anchor) |a| allocator.free(a);
+            if (ev.data.sequence_start.anchor) |a| freeNameIfOwned(allocator, scan_source, a);
             if (ev.data.sequence_start.tag) |t| allocator.free(t);
         },
         .mapping_start => {
-            if (ev.data.mapping_start.anchor) |a| allocator.free(a);
+            if (ev.data.mapping_start.anchor) |a| freeNameIfOwned(allocator, scan_source, a);
             if (ev.data.mapping_start.tag) |t| allocator.free(t);
         },
         else => {},
@@ -435,7 +467,8 @@ pub const Stream = struct {
             anchor: ?[]const u8 = null,
         },
         mapping: struct {
-            staging: std.array_hash_map.String(Node) = .empty,
+            entries: std.ArrayListUnmanaged(MapEntry) = .empty,
+            dedup: MappingDedup = .{},
             awaiting_key: bool = true,
             pending_key: ?[]const u8 = null,
             key_anchor: ?[]const u8 = null,
@@ -449,7 +482,7 @@ pub const Stream = struct {
     scalar_pool: ?*Document.OwnedScalarPool,
     shared_pin: ?*Document.SharedPin = null,
     docs: std.ArrayListUnmanaged(Document) = .empty,
-    arena: std.heap.ArenaAllocator,
+    doc_storage: Document.DocumentArena,
     doc_a: std.mem.Allocator,
     anchors: std.StringHashMapUnmanaged(Node) = .empty,
     stack: std.ArrayListUnmanaged(Frame) = .empty,
@@ -468,7 +501,7 @@ pub const Stream = struct {
             .options = options,
             .scan_source = scan_source,
             .scalar_pool = scalar_pool,
-            .arena = std.heap.ArenaAllocator.init(gpa),
+            .doc_storage = Document.DocumentArena.initDirect(gpa),
             .doc_a = undefined,
         };
     }
@@ -480,15 +513,15 @@ pub const Stream = struct {
             self.stack.deinit(self.doc_a);
             self.anchors.deinit(self.doc_a);
         }
-        _ = self.arena.deinit();
+        self.doc_storage.deinit();
         if (self.shared_pin) |pin| pin.release();
     }
 
     pub fn feed(self: *Stream, event_gpa: std.mem.Allocator, ev_in: Event) !void {
         var ev = ev_in;
-        errdefer releaseOneEvent(event_gpa, ev);
+        errdefer releaseOneEvent(event_gpa, self.scan_source, ev);
         try self.feedInner(event_gpa, &ev);
-        releaseOneEvent(event_gpa, ev);
+        releaseOneEvent(event_gpa, self.scan_source, ev);
     }
 
     fn feedInner(self: *Stream, event_gpa: std.mem.Allocator, ev: *Event) !void {
@@ -511,8 +544,9 @@ pub const Stream = struct {
             else
                 try Document.SharedPin.createBorrowed(self.gpa, self.scan_source);
         }
-        _ = self.arena.reset(.retain_capacity);
-        self.doc_a = self.arena.allocator();
+        self.doc_storage.deinit();
+        self.doc_storage = try Document.DocumentArena.init(self.gpa, self.scan_source.len);
+        self.doc_a = self.doc_storage.allocator();
         self.anchors = .{};
         self.stack.clearRetainingCapacity();
         self.root = .null;
@@ -526,10 +560,10 @@ pub const Stream = struct {
         const pin = self.shared_pin orelse return Error.Parse.UnexpectedToken;
         pin.retain();
         if (self.scalar_pool) |pool| pool.retain();
-        const doc_arena = self.arena;
-        try self.docs.append(self.gpa, Document.init(self.gpa, doc_arena, self.root, pin, self.scalar_pool));
+        const doc_storage = self.doc_storage;
+        try self.docs.append(self.gpa, Document.init(self.gpa, doc_storage, self.root, pin, self.scalar_pool));
         self.in_document = false;
-        self.arena = std.heap.ArenaAllocator.init(self.gpa);
+        self.doc_storage = Document.DocumentArena.initDirect(self.gpa);
     }
 
     fn pinnedSource(self: *Stream) []const u8 {
@@ -544,7 +578,7 @@ pub const Stream = struct {
     }
 
     fn keepAnchorName(self: *Stream, anchor: ?[]const u8) !?[]const u8 {
-        if (anchor) |a| return try self.doc_a.dupe(u8, a);
+        if (anchor) |a| return try persistName(self.doc_a, self.scan_source, a);
         return null;
     }
 
@@ -560,7 +594,7 @@ pub const Stream = struct {
         };
         const result: Node = .{ .sequence = seq_frame.nodes };
         if (seq_frame.anchor) |anchor_name| {
-            try putAnchor(self.doc_a, &self.anchors, anchor_name, result);
+            try putAnchor(self.doc_a, self.scan_source, &self.anchors, anchor_name, result);
         }
         try self.completeNode(result);
     }
@@ -575,10 +609,10 @@ pub const Stream = struct {
             .mapping => |m| m,
             else => return Error.Parse.UnexpectedToken,
         };
-        const map = try mappingFromStaging(self.doc_a, &map_frame.staging);
-        const result: Node = .{ .mapping = map };
+        map_frame.dedup.deinit(self.doc_a);
+        const result: Node = .{ .mapping = map_frame.entries };
         if (map_frame.anchor) |anchor_name| {
-            try putAnchor(self.doc_a, &self.anchors, anchor_name, result);
+            try putAnchor(self.doc_a, self.scan_source, &self.anchors, anchor_name, result);
         }
         try self.completeNode(result);
     }
@@ -641,7 +675,7 @@ pub const Stream = struct {
                 );
                 if (ev.data.scalar.anchor) |anchor_name| {
                     if (self.skip_anchor == null or !std.mem.eql(u8, anchor_name, self.skip_anchor.?)) {
-                        try putAnchor(self.doc_a, &self.anchors, anchor_name, resolved);
+                        try putAnchor(self.doc_a, self.scan_source, &self.anchors, anchor_name, resolved);
                     }
                 }
                 self.skip_anchor = null;
@@ -669,15 +703,7 @@ pub const Stream = struct {
                 m.key_anchor = null;
                 m.awaiting_key = true;
                 self.skip_anchor = null;
-                const gop = try m.staging.getOrPut(self.doc_a, key);
-                if (gop.found_existing) {
-                    switch (self.options.duplicate_keys) {
-                        .reject => return Error.Parse.DuplicateKey,
-                        .keep_last => gop.value_ptr.* = node,
-                    }
-                } else {
-                    gop.value_ptr.* = node;
-                }
+                try insertMappingEntry(self.doc_a, &m.entries, &m.dedup, self.options, key, node);
             },
         }
     }
@@ -686,11 +712,14 @@ pub const Stream = struct {
         if (self.docs.items.len == 0) {
             if (self.shared_pin) |pin| pin.release();
             if (self.scalar_pool) |pool| pool.release();
+            self.doc_storage.deinit();
             return &.{};
         }
         if (self.scalar_pool) |pool| pool.release();
         const out = try self.docs.toOwnedSlice(gpa);
         self.docs = .empty;
+        self.doc_storage.deinit();
+        self.shared_pin = null;
         return out;
     }
 };

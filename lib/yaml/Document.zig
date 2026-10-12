@@ -99,20 +99,58 @@ pub const OwnedScalarPool = struct {
         self.refs += 1;
     }
 
+    pub fn scratchAlloc(self: *OwnedScalarPool) std.mem.Allocator {
+        return self.arena.allocator();
+    }
+
     pub fn release(self: *OwnedScalarPool) void {
         if (self.refs == 0) return;
         self.refs -= 1;
         if (self.refs == 0) {
             const parent = self.parent;
-            self.scratch.deinit(parent);
+            self.scratch.deinit(self.arena.allocator());
             self.arena.deinit();
             parent.destroy(self);
         }
     }
 };
 
+/// Node-tree memory: one GPA slab + bump arena for large inputs, plain arena otherwise.
+pub const DocumentArena = struct {
+    parent: std.mem.Allocator,
+    slab: ?[]u8 = null,
+    bump: std.heap.FixedBufferAllocator,
+    arena: std.heap.ArenaAllocator,
+
+    pub fn init(parent: std.mem.Allocator, hint_bytes: usize) !DocumentArena {
+        _ = hint_bytes;
+        return initDirect(parent);
+    }
+
+    pub fn initDirect(parent: std.mem.Allocator) DocumentArena {
+        return .{
+            .parent = parent,
+            .slab = null,
+            .bump = undefined,
+            .arena = std.heap.ArenaAllocator.init(parent),
+        };
+    }
+
+    pub fn deinit(self: *DocumentArena) void {
+        _ = self.arena.deinit();
+        if (self.slab) |s| {
+            self.parent.free(s);
+            self.slab = null;
+        }
+    }
+
+    pub fn allocator(self: *DocumentArena) std.mem.Allocator {
+        return self.arena.allocator();
+    }
+};
+
 allocator: std.mem.Allocator,
-arena: std.heap.ArenaAllocator,
+storage: DocumentArena,
 root: Node,
 /// Optional shared input pin; string nodes may point into `shared_pin.bytes`.
 shared_pin: ?*SharedPin = null,
@@ -126,14 +164,14 @@ scalar_pool: ?*OwnedScalarPool = null,
 /// `deinit` releases everything in one shot (and drops one pin retain).
 pub fn init(
     allocator: std.mem.Allocator,
-    arena: std.heap.ArenaAllocator,
+    storage: DocumentArena,
     root: Node,
     shared_pin: ?*SharedPin,
     scalar_pool: ?*OwnedScalarPool,
 ) Document {
     return .{
         .allocator = allocator,
-        .arena = arena,
+        .storage = storage,
         .root = root,
         .shared_pin = shared_pin,
         .scalar_pool = scalar_pool,
@@ -144,7 +182,7 @@ pub fn init(
 pub fn deinit(self: *Document) void {
     if (self.shared_pin) |pin| pin.release();
     if (self.scalar_pool) |pool| pool.release();
-    self.arena.deinit();
+    self.storage.deinit();
     self.* = undefined;
 }
 

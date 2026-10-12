@@ -33,7 +33,7 @@ pub fn parseDocument(
     const docs = try parseStream(allocator, source, options);
     defer allocator.free(docs);
     if (docs.len == 0) {
-        return Document.init(allocator, std.heap.ArenaAllocator.init(allocator), .null, null, null);
+        return Document.init(allocator, Document.DocumentArena.initDirect(allocator), .null, null, null);
     }
     if (docs.len != 1) {
         for (docs) |*doc| doc.deinit();
@@ -94,7 +94,9 @@ pub fn parseStream(
 
     const scalar_pool = try Document.OwnedScalarPool.create(allocator);
     errdefer scalar_pool.release();
-
+    if (scanned.source.len >= 512 * 1024) {
+        try scalar_pool.scratch.ensureTotalCapacity(scalar_pool.scratchAlloc(), @min(scanned.source.len / 2, 8 * 1024 * 1024));
+    }
     var stream = Composer.Stream.init(allocator, options, scanned.source, scalar_pool);
     errdefer stream.deinit();
 
@@ -126,7 +128,7 @@ pub fn parseEvents(
 test parseEvents {
     const allocator = std.testing.allocator;
     const events = try parseEvents(allocator, "a: 1\n", .{});
-    defer Composer.freeEvents(allocator, events);
+    defer Composer.freeEvents(allocator, events, "a: 1\n");
     try std.testing.expect(events.len >= 4);
     try std.testing.expect(events[0].kind == .stream_start);
 }
@@ -181,7 +183,7 @@ pub fn formatTestsuiteEvents(allocator: std.mem.Allocator, source: []const u8) !
     var parser = Parser.init(allocator, scanned, .{});
     defer parser.deinit();
     const events = try parser.parse();
-    defer Composer.freeEvents(allocator, events);
+    defer Composer.freeEvents(allocator, events, source);
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);

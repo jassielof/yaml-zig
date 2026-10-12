@@ -23,12 +23,15 @@ options: Options.Parse,
 /// Allocator for rebuilt scalar buffers (defaults to `allocator`).
 scalar_allocator: std.mem.Allocator,
 scalar_pool_backed: bool = false,
+scalar_pool: ?*@import("Document.zig").OwnedScalarPool = null,
 stream: ?*Composer.Stream = null,
 emit_sink: EmitSink = .direct,
 flow_scratch: std.ArrayListUnmanaged(EventModel.Event) = .empty,
 pending_scalar_tag: ?[]const u8 = null,
 events: std.ArrayListUnmanaged(EventModel.Event) = .empty,
 index: usize = 0,
+/// When the last rebuilt scalar lives in `scalar_pool.scratch`, byte offset at start.
+last_scalar_scratch_start: ?usize = null,
 
 pub fn init(allocator: std.mem.Allocator, scanned: Scanner.ScannedDocument, options: Options.Parse) Parser {
     return initWithScalarPool(allocator, scanned, options, null, null);
@@ -47,6 +50,7 @@ pub fn initWithScalarPool(
         .options = options,
         .scalar_allocator = if (scalar_pool) |p| p.arena.allocator() else allocator,
         .scalar_pool_backed = scalar_pool != null,
+        .scalar_pool = scalar_pool,
         .stream = stream,
     };
 }
@@ -67,16 +71,16 @@ fn freeEventSlice(self: *Parser, slice: []EventModel.Event) void {
                 if (ev.data.scalar.value_owned and !ev.data.scalar.pool_backed) {
                     self.allocator.free(ev.data.scalar.value);
                 }
-                if (ev.data.scalar.anchor) |anchor| self.allocator.free(anchor);
+                if (ev.data.scalar.anchor) |anchor| self.freeNameIfOwned(anchor);
                 if (ev.data.scalar.tag) |tag| self.allocator.free(tag);
             },
-            .alias => self.allocator.free(ev.data.alias.name),
+            .alias => self.freeNameIfOwned(ev.data.alias.name),
             .sequence_start => {
-                if (ev.data.sequence_start.anchor) |a| self.allocator.free(a);
+                if (ev.data.sequence_start.anchor) |a| self.freeNameIfOwned(a);
                 if (ev.data.sequence_start.tag) |t| self.allocator.free(t);
             },
             .mapping_start => {
-                if (ev.data.mapping_start.anchor) |a| self.allocator.free(a);
+                if (ev.data.mapping_start.anchor) |a| self.freeNameIfOwned(a);
                 if (ev.data.mapping_start.tag) |t| self.allocator.free(t);
             },
             else => {},
@@ -202,7 +206,7 @@ fn parseBlockValue(self: *Parser, indent: usize, is_root: bool) anyerror!void {
 
     if (line.kind == .scalar and (line.style == .single_quoted or line.style == .double_quoted)) {
         const multiline = try self.collectMultilineQuotedScalar(indent, line.style);
-        defer self.allocator.free(multiline);
+        defer self.releaseTempScalar(multiline);
         try self.parseScalarLikeValue(multiline, line.style, line.line_no, line.indent);
         return;
     }
@@ -211,7 +215,7 @@ fn parseBlockValue(self: *Parser, indent: usize, is_root: bool) anyerror!void {
     if (line.kind == .scalar and line.style == .plain) {
         const min_cont = if (is_root) @as(usize, 0) else indent;
         const joined = try self.collectPlainContinuation(min_cont, line.value);
-        defer self.allocator.free(joined);
+        defer self.releaseTempScalar(joined);
 
         // Check if value is just tags/anchors — look ahead for block structure
         const stripped = stripTagPrefix(std.mem.trim(u8, joined, " "));
@@ -228,7 +232,7 @@ fn parseBlockValue(self: *Parser, indent: usize, is_root: bool) anyerror!void {
                         .kind = .sequence_start,
                         .data = .{ .sequence_start = .{
                             .style = .block,
-                            .anchor = try self.allocator.dupe(u8, a),
+                            .anchor = try self.persistName(a),
                         } },
                     });
                     while (self.index < self.scanned.lines.items.len) {
@@ -257,7 +261,7 @@ fn parseBlockValue(self: *Parser, indent: usize, is_root: bool) anyerror!void {
                         .kind = .mapping_start,
                         .data = .{ .mapping_start = .{
                             .style = .block,
-                            .anchor = try self.allocator.dupe(u8, a),
+                            .anchor = try self.persistName(a),
                         } },
                     });
                     while (self.index < self.scanned.lines.items.len) {
@@ -398,7 +402,7 @@ fn parseBlockSequence(self: *Parser, indent: usize) anyerror!void {
         // For plain scalars, collect multiline continuation
         if (line.style == .plain) {
             var final_text = try self.collectPlainContinuation(indent + 1, line.value);
-            defer self.allocator.free(final_text);
+            defer self.releaseTempScalar(final_text);
 
             // Absorb sequence_item lines at indent > seq_indent as plain text (AB8U).
             // A comment ends that plain scalar, so later dashes stay structure.
@@ -408,14 +412,18 @@ fn parseBlockSequence(self: *Parser, indent: usize) anyerror!void {
                     if (nl.after_comment) break;
                     if (nl.kind != .sequence_item or nl.indent <= indent) break;
                     const trimmed = std.mem.trim(u8, nl.value, " ");
-                    const new_buf = try self.allocator.alloc(u8, final_text.len + 3 + trimmed.len);
-                    @memcpy(new_buf[0..final_text.len], final_text);
-                    new_buf[final_text.len] = ' ';
-                    new_buf[final_text.len + 1] = '-';
-                    new_buf[final_text.len + 2] = ' ';
-                    @memcpy(new_buf[final_text.len + 3 ..][0..trimmed.len], trimmed);
-                    self.allocator.free(final_text);
-                    final_text = new_buf[0 .. final_text.len + 3 + trimmed.len];
+                    if (self.last_scalar_scratch_start) |st| {
+                        final_text = try self.extendPlainAtPoolStart(st, trimmed);
+                    } else {
+                        const new_buf = try self.allocator.alloc(u8, final_text.len + 3 + trimmed.len);
+                        @memcpy(new_buf[0..final_text.len], final_text);
+                        new_buf[final_text.len] = ' ';
+                        new_buf[final_text.len + 1] = '-';
+                        new_buf[final_text.len + 2] = ' ';
+                        @memcpy(new_buf[final_text.len + 3 ..][0..trimmed.len], trimmed);
+                        self.allocator.free(final_text);
+                        final_text = new_buf[0 .. final_text.len + 3 + trimmed.len];
+                    }
                     self.index += 1;
                 }
             }
@@ -550,7 +558,7 @@ fn emitSequenceItemMapping(self: *Parser, line: Scanner.ScannedLine, seq_indent:
             // Fold indented continuation lines into the plain value
             // (`- message: …\n    specified`).
             const joined = try self.collectPlainContinuation(seq_indent + 1, raw_val);
-            defer self.allocator.free(joined);
+            defer self.releaseTempScalar(joined);
             try self.parseScalarLikeValue(joined, .plain, line.line_no, seq_indent + 2);
         } else {
             try self.parseScalarLikeValue(raw_val, vs, line.line_no, seq_indent + 2);
@@ -574,7 +582,7 @@ fn emitVirtualEmptyBlock(self: *Parser, next_line: Scanner.ScannedLine, anchor: 
             .kind = .sequence_start,
             .data = .{ .sequence_start = .{
                 .style = .block,
-                .anchor = if (anchor) |a| try self.allocator.dupe(u8, a) else null,
+                .anchor = if (anchor) |a| try self.persistName(a) else null,
             } },
         });
         const seq_indent = next_line.indent;
@@ -598,7 +606,7 @@ fn emitVirtualEmptyBlock(self: *Parser, next_line: Scanner.ScannedLine, anchor: 
             .kind = .mapping_start,
             .data = .{ .mapping_start = .{
                 .style = .block,
-                .anchor = if (anchor) |a| try self.allocator.dupe(u8, a) else null,
+                .anchor = if (anchor) |a| try self.persistName(a) else null,
             } },
         });
         const map_indent = next_line.indent;
@@ -690,7 +698,7 @@ fn emitSingleMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_inden
         } else if (isAliasToken(key_without_anchor)) |alias_name| {
             try self.emitEvent( .{
                 .kind = .alias,
-                .data = .{ .alias = .{ .name = try self.allocator.dupe(u8, alias_name), .span = line.span } },
+                .data = .{ .alias = .{ .name = try self.persistName(alias_name), .span = line.span } },
             });
         } else {
             const effective_key_style = detectInlineStyle(key_without_anchor);
@@ -719,7 +727,7 @@ fn emitSingleMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_inden
                             .kind = .sequence_start,
                             .data = .{ .sequence_start = .{
                                 .style = .block,
-                                .anchor = try self.allocator.dupe(u8, anch),
+                                .anchor = try self.persistName(anch),
                             } },
                         });
                         while (self.index < self.scanned.lines.items.len) {
@@ -743,7 +751,7 @@ fn emitSingleMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_inden
                             .kind = .mapping_start,
                             .data = .{ .mapping_start = .{
                                 .style = .block,
-                                .anchor = try self.allocator.dupe(u8, anch),
+                                .anchor = try self.persistName(anch),
                             } },
                         });
                         while (self.index < self.scanned.lines.items.len) {
@@ -783,7 +791,7 @@ fn emitSingleMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_inden
                                             .kind = .sequence_start,
                                             .data = .{ .sequence_start = .{
                                                 .style = .block,
-                                                .anchor = try self.allocator.dupe(u8, anch),
+                                                .anchor = try self.persistName(anch),
                                             } },
                                         });
                                         while (self.index < self.scanned.lines.items.len) {
@@ -807,7 +815,7 @@ fn emitSingleMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_inden
                                             .kind = .mapping_start,
                                             .data = .{ .mapping_start = .{
                                                 .style = .block,
-                                                .anchor = try self.allocator.dupe(u8, anch),
+                                                .anchor = try self.persistName(anch),
                                             } },
                                         });
                                         while (self.index < self.scanned.lines.items.len) {
@@ -836,7 +844,7 @@ fn emitSingleMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_inden
                                     self.index += 1;
                                     try self.emitEvent( .{
                                         .kind = .alias,
-                                        .data = .{ .alias = .{ .name = try self.allocator.dupe(u8, alias_name), .span = next.span } },
+                                        .data = .{ .alias = .{ .name = try self.persistName(alias_name), .span = next.span } },
                                     });
                                     return;
                                 }
@@ -851,7 +859,7 @@ fn emitSingleMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_inden
                         .kind = .sequence_start,
                         .data = .{ .sequence_start = .{
                             .style = .block,
-                            .anchor = try self.allocator.dupe(u8, anch),
+                            .anchor = try self.persistName(anch),
                         } },
                     });
                     while (self.index < self.scanned.lines.items.len) {
@@ -912,7 +920,7 @@ fn emitSingleMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_inden
             const quote2: u8 = trimmed_after2[0];
             if (!hasClosingQuote(trimmed_after2, quote2)) {
                 const multiline = try self.collectMultilineQuotedValue(line.indent, trimmed_after2, qs);
-                defer self.allocator.free(multiline);
+                defer self.releaseTempScalar(multiline);
                 try self.parseScalarLikeValue(multiline, qs, line.line_no, line.indent);
                 return;
             }
@@ -923,7 +931,7 @@ fn emitSingleMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_inden
         const quote: u8 = if (line.style == .double_quoted) '"' else '\'';
         if (!hasClosingQuote(line.value, quote)) {
             const multiline = try self.collectMultilineQuotedValue(line.indent, line.value, line.style);
-            defer self.allocator.free(multiline);
+            defer self.releaseTempScalar(multiline);
             try self.parseScalarLikeValue(multiline, line.style, line.line_no, line.indent);
             return;
         }
@@ -931,7 +939,7 @@ fn emitSingleMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_inden
 
     if (line.style == .plain and line.value.len > 0) {
         const joined = try self.collectPlainContinuation(line.indent + 1, line.value);
-        defer self.allocator.free(joined);
+        defer self.releaseTempScalar(joined);
         try self.parseScalarLikeValue(joined, .plain, line.line_no, line.indent + line.key.len + 1);
         return;
     }
@@ -968,7 +976,7 @@ fn emitExplicitMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_ind
         if (key_style == .literal or key_style == .folded) {
             try self.pushBlockScalar(key_text, key_style, null, line.span);
         } else {
-            defer self.allocator.free(key_text);
+            defer self.releaseTempScalar(key_text);
             if (key_style == .plain) {
                 const trimmed = std.mem.trim(u8, key_text, " \t");
                 if (trimmed.len == 0 or isSubslice(self.scanned.source, trimmed)) {
@@ -1033,7 +1041,7 @@ fn emitExplicitMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_ind
     }
 
     const joined = try self.collectExplicitPlainValue(parent_indent, trimmed);
-    defer self.allocator.free(joined);
+    defer self.releaseTempScalar(joined);
     try self.parseScalarLikeValue(joined, detectInlineStyle(trimmed), value_line_no, parent_indent);
 }
 
@@ -1042,33 +1050,33 @@ fn collectExplicitKey(self: *Parser, line: Scanner.ScannedLine, parent_indent: u
         return self.collectBlockScalar(parent_indent, line.key_style, line.key, line.line_no);
     }
 
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(self.allocator);
+    var b = ScalarBuilder.init(self);
+    defer b.deinit();
     const stripped = stripTagPrefix(std.mem.trim(u8, line.key, " \t"));
-    try out.appendSlice(self.allocator, std.mem.trim(u8, stripped, " \t"));
+    try b.appendSlice(std.mem.trim(u8, stripped, " \t"));
     self.index += 1;
     while (self.index < self.scanned.lines.items.len) {
         const next = self.scanned.lines.items[self.index];
         if (next.indent <= parent_indent or next.kind != .scalar) break;
-        if (out.items.len > 0) try out.append(self.allocator, ' ');
-        try out.appendSlice(self.allocator, std.mem.trim(u8, stripTagPrefix(next.value), " \t"));
+        if (b.len() > 0) try b.appendByte(' ');
+        try b.appendSlice(std.mem.trim(u8, stripTagPrefix(next.value), " \t"));
         self.index += 1;
     }
-    return out.toOwnedSlice(self.allocator);
+    return b.finish();
 }
 
 fn collectExplicitPlainValue(self: *Parser, parent_indent: usize, initial: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(self.allocator);
-    try out.appendSlice(self.allocator, std.mem.trim(u8, initial, " \t"));
+    var b = ScalarBuilder.init(self);
+    defer b.deinit();
+    try b.appendSlice(std.mem.trim(u8, initial, " \t"));
     while (self.index < self.scanned.lines.items.len) {
         const next = self.scanned.lines.items[self.index];
         if (next.indent <= parent_indent or next.kind != .scalar) break;
-        if (out.items.len > 0) try out.append(self.allocator, ' ');
-        try out.appendSlice(self.allocator, std.mem.trim(u8, next.value, " \t"));
+        if (b.len() > 0) try b.appendByte(' ');
+        try b.appendSlice(std.mem.trim(u8, next.value, " \t"));
         self.index += 1;
     }
-    return out.toOwnedSlice(self.allocator);
+    return b.finish();
 }
 
 fn emitCompactSequence(self: *Parser, parent_indent: usize, first: []const u8, span: @import("Span.zig"), line_no: usize) anyerror!void {
@@ -1139,14 +1147,14 @@ fn appendLiteralBlockLine(
                 p[pin_write.*] = '\n';
                 pin_write.* += 1;
             } else if (pool) |pl| {
-                try pl.scratch.appendSlice(pl.parent, slice);
-                try pl.scratch.append(pl.parent, '\n');
+                try pl.scratch.appendSlice(pl.scratchAlloc(), slice);
+                try pl.scratch.append(pl.scratchAlloc(), '\n');
             }
         } else if (pin) |p| {
             p[pin_write.*] = '\n';
             pin_write.* += 1;
         } else if (pool) |pl| {
-            try pl.scratch.append(pl.parent, '\n');
+            try pl.scratch.append(pl.scratchAlloc(), '\n');
         }
         return;
     }
@@ -1158,14 +1166,14 @@ fn appendLiteralBlockLine(
             p[pin_write.*] = '\n';
             pin_write.* += 1;
         } else if (pool) |pl| {
-            try pl.scratch.appendSlice(pl.parent, slice);
-            try pl.scratch.append(pl.parent, '\n');
+            try pl.scratch.appendSlice(pl.scratchAlloc(), slice);
+            try pl.scratch.append(pl.scratchAlloc(), '\n');
         }
     } else if (pin) |p| {
         p[pin_write.*] = '\n';
         pin_write.* += 1;
     } else if (pool) |pl| {
-        try pl.scratch.append(pl.parent, '\n');
+        try pl.scratch.append(pl.scratchAlloc(), '\n');
     }
 }
 
@@ -1323,7 +1331,7 @@ fn collectBlockScalar(
             if (self.pinBorrowSlice(content)) |borrowed| return @constCast(borrowed);
             if (literal_pool) |pl| {
                 const s = pl.startScalar();
-                try pl.scratch.appendSlice(pl.parent, content);
+                try pl.scratch.appendSlice(pl.scratchAlloc(), content);
                 return @constCast(pl.scalarSlice(s));
             }
             return try self.scalar_allocator.dupe(u8, content);
@@ -1346,7 +1354,7 @@ fn collectBlockScalar(
                     .clip => {
                         while (len > 0 and buf[start + len - 1] == '\n') len -= 1;
                         pl.truncateScalar(start + len);
-                        if (has_content) try pl.scratch.append(pl.parent, '\n');
+                        if (has_content) try pl.scratch.append(pl.scratchAlloc(), '\n');
                         return @constCast(pl.scalarSlice(start));
                     },
                     .keep => {},
@@ -1542,7 +1550,7 @@ fn parseScalarLikeValue(
         if (alias_name.len == 0 or rest.len != 0) return Error.Parse.InvalidAlias;
         try self.emitEvent( .{
             .kind = .alias,
-            .data = .{ .alias = .{ .name = try self.allocator.dupe(u8, alias_name), .span = .{} } },
+            .data = .{ .alias = .{ .name = try self.persistName(alias_name), .span = .{} } },
         });
         return;
     }
@@ -1558,8 +1566,8 @@ fn parseScalarLikeValue(
             if (list.items.len > pre_flow_count) {
                 const first = &list.items[pre_flow_count];
                 switch (first.kind) {
-                    .sequence_start => first.data.sequence_start.anchor = try self.allocator.dupe(u8, aname),
-                    .mapping_start => first.data.mapping_start.anchor = try self.allocator.dupe(u8, aname),
+                    .sequence_start => first.data.sequence_start.anchor = try self.persistName(aname),
+                    .mapping_start => first.data.mapping_start.anchor = try self.persistName(aname),
                     else => {},
                 }
             }
@@ -1643,11 +1651,11 @@ fn noteFlowAnchor(self: *Parser, anchor: []const u8) !void {
     const list = self.activeEventList();
     if (list.items.len == 0) return;
     const ev = &list.items[list.items.len - 1];
-    const name = try self.allocator.dupe(u8, anchor);
+    const name = try self.persistName(anchor);
     switch (ev.kind) {
         .sequence_start => ev.data.sequence_start.anchor = name,
         .mapping_start => ev.data.mapping_start.anchor = name,
-        else => self.allocator.free(name),
+        else => self.freeNameIfOwned(name),
     }
 }
 
@@ -1707,7 +1715,7 @@ fn parseFlowValue(self: *Parser, tokens: []const Token.Token, cursor: *usize) an
                 } else if (key.kind == .alias) {
                     try self.emitEvent( .{
                         .kind = .alias,
-                        .data = .{ .alias = .{ .name = try self.allocator.dupe(u8, key.lexeme), .span = key.span } },
+                        .data = .{ .alias = .{ .name = try self.persistName(key.lexeme), .span = key.span } },
                     });
                     cursor.* += 1;
                     if (cursor.* < tokens.len and tokens[cursor.*].kind == .colon) {
@@ -1750,7 +1758,7 @@ fn parseFlowValue(self: *Parser, tokens: []const Token.Token, cursor: *usize) an
         .alias => {
             try self.emitEvent( .{
                 .kind = .alias,
-                .data = .{ .alias = .{ .name = try self.allocator.dupe(u8, tok.lexeme), .span = tok.span } },
+                .data = .{ .alias = .{ .name = try self.persistName(tok.lexeme), .span = tok.span } },
             });
             cursor.* += 1;
         },
@@ -1925,103 +1933,184 @@ fn isVirtualEmptyValue(value: []const u8, style: Token.ScalarStyle) bool {
     return std.mem.trim(u8, no_anchor, " ").len == 0;
 }
 
-fn collectPlainContinuation(self: *Parser, min_indent: usize, initial: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    defer out.deinit(self.allocator);
+const ScalarBuilder = struct {
+    parser: *Parser,
+    pool_start: usize,
+    use_pool: bool,
+    fallback: std.ArrayListUnmanaged(u8) = .empty,
 
-    try out.appendSlice(self.allocator, std.mem.trim(u8, initial, " "));
+    fn init(parser: *Parser) ScalarBuilder {
+        if (parser.scalar_pool) |pool| {
+            return .{
+                .parser = parser,
+                .pool_start = pool.startScalar(),
+                .use_pool = true,
+            };
+        }
+        return .{ .parser = parser, .pool_start = 0, .use_pool = false };
+    }
+
+    fn deinit(self: *ScalarBuilder) void {
+        if (!self.use_pool) self.fallback.deinit(self.parser.allocator);
+    }
+
+    fn len(self: *const ScalarBuilder) usize {
+        if (self.use_pool) {
+            const pool = self.parser.scalar_pool.?;
+            return pool.scratch.items.len - self.pool_start;
+        }
+        return self.fallback.items.len;
+    }
+
+    fn itemsMut(self: *ScalarBuilder) []u8 {
+        if (self.use_pool) {
+            const pool = self.parser.scalar_pool.?;
+            return pool.scratch.items[self.pool_start..];
+        }
+        return self.fallback.items;
+    }
+
+    fn appendSlice(self: *ScalarBuilder, s: []const u8) !void {
+        if (self.use_pool) {
+            const pool = self.parser.scalar_pool.?;
+            try pool.scratch.appendSlice(pool.scratchAlloc(), s);
+        } else {
+            try self.fallback.appendSlice(self.parser.allocator, s);
+        }
+    }
+
+    fn appendByte(self: *ScalarBuilder, c: u8) !void {
+        if (self.use_pool) {
+            const pool = self.parser.scalar_pool.?;
+            try pool.scratch.append(pool.scratchAlloc(), c);
+        } else {
+            try self.fallback.append(self.parser.allocator, c);
+        }
+    }
+
+    fn pop(self: *ScalarBuilder) ?u8 {
+        if (self.len() == 0) return null;
+        if (self.use_pool) {
+            const pool = self.parser.scalar_pool.?;
+            return pool.scratch.pop();
+        }
+        return self.fallback.pop();
+    }
+
+    fn finish(self: *ScalarBuilder) ![]u8 {
+        if (self.use_pool) {
+            const pool = self.parser.scalar_pool.?;
+            self.parser.last_scalar_scratch_start = self.pool_start;
+            return @constCast(pool.scalarSlice(self.pool_start));
+        }
+        self.parser.last_scalar_scratch_start = null;
+        return self.fallback.toOwnedSlice(self.parser.allocator);
+    }
+};
+
+fn extendPlainAtPoolStart(self: *Parser, start: usize, trimmed: []const u8) ![]u8 {
+    const pool = self.scalar_pool orelse return error.OutOfMemory;
+    try pool.scratch.append(pool.scratchAlloc(), ' ');
+    try pool.scratch.append(pool.scratchAlloc(), '-');
+    try pool.scratch.append(pool.scratchAlloc(), ' ');
+    try pool.scratch.appendSlice(pool.scratchAlloc(), trimmed);
+    self.last_scalar_scratch_start = start;
+    return @constCast(pool.scalarSlice(start));
+}
+
+fn collectPlainContinuation(self: *Parser, min_indent: usize, initial: []const u8) ![]u8 {
+    var b = ScalarBuilder.init(self);
+    defer b.deinit();
+
+    try b.appendSlice(std.mem.trim(u8, initial, " "));
 
     const start = self.scanned.lines.items[self.index];
     var prev_line_no = start.line_no;
     self.index += 1;
-    // A trailing comment ends the plain scalar (`word1 # comment` / `word2`).
-    if (start.ends_with_comment) return out.toOwnedSlice(self.allocator);
-    // A finished quoted or flow node does not continue onto the next line
-    // (`!foo "bar"` then `%TAG`).
-    if (isClosedNode(initial)) return out.toOwnedSlice(self.allocator);
+    if (start.ends_with_comment) return b.finish();
+    if (isClosedNode(initial)) return b.finish();
 
     while (self.index < self.scanned.lines.items.len) {
         const line = self.scanned.lines.items[self.index];
         if (line.indent < min_indent or line.kind != .scalar) break;
-        // A comment-only line between plain lines ends the scalar.
         if (line.after_comment) break;
 
         const gap = if (line.line_no > prev_line_no) line.line_no - prev_line_no - 1 else 0;
         if (gap > 0) {
             var g: usize = 0;
-            while (g < gap) : (g += 1) try out.append(self.allocator, '\n');
-        } else if (out.items.len > 0) {
-            try out.append(self.allocator, ' ');
+            while (g < gap) : (g += 1) try b.appendByte('\n');
+        } else if (b.len() > 0) {
+            try b.appendByte(' ');
         }
 
-        try out.appendSlice(self.allocator, std.mem.trim(u8, line.value, " "));
+        try b.appendSlice(std.mem.trim(u8, line.value, " "));
         prev_line_no = line.line_no;
         self.index += 1;
         if (line.ends_with_comment) break;
     }
 
-    return out.toOwnedSlice(self.allocator);
+    return b.finish();
 }
 
 fn collectMultilineQuotedScalar(self: *Parser, base_indent: usize, style: Token.ScalarStyle) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    defer out.deinit(self.allocator);
+    var b = ScalarBuilder.init(self);
+    defer b.deinit();
 
     const quote: u8 = if (style == .double_quoted) '"' else '\'';
 
     const first = self.scanned.lines.items[self.index];
-    try out.appendSlice(self.allocator, first.value);
+    try b.appendSlice(first.value);
     var prev_line_no = first.line_no;
     self.index += 1;
 
-    while (self.index < self.scanned.lines.items.len and !hasClosingQuote(out.items, quote)) {
+    while (self.index < self.scanned.lines.items.len and !hasClosingQuote(b.itemsMut(), quote)) {
         const line = self.scanned.lines.items[self.index];
         if (line.kind == .document_end or line.kind == .empty_document) break;
         if (line.indent < base_indent) break;
 
         const gap = if (line.line_no > prev_line_no) line.line_no - prev_line_no - 1 else 0;
 
-        stripTrailingQuoteWs(&out, style);
+        stripTrailingQuoteWsBuilder(&b, style);
 
-        if (style == .double_quoted and hasTrailingEscapedNewline(out.items)) {
-            _ = out.pop();
+        if (style == .double_quoted and hasTrailingEscapedNewline(b.itemsMut())) {
+            _ = b.pop();
             const trimmed = std.mem.trimStart(u8, line.value, " \t");
-            try out.appendSlice(self.allocator, trimmed);
+            try b.appendSlice(trimmed);
         } else {
             const trimmed = std.mem.trimStart(u8, std.mem.trim(u8, line.value, " \t"), " \t");
             const doc_end = trimDocEndLine(trimmed, style);
             if (gap > 0) {
                 var g: usize = 0;
-                while (g < gap) : (g += 1) try out.append(self.allocator, '\n');
+                while (g < gap) : (g += 1) try b.appendByte('\n');
             } else {
-                try out.append(self.allocator, ' ');
+                try b.appendByte(' ');
             }
             if (doc_end.prefix.len > 0) {
-                try out.appendSlice(self.allocator, doc_end.prefix);
-                try out.appendSlice(self.allocator, doc_end.rest);
+                try b.appendSlice(doc_end.prefix);
+                try b.appendSlice(doc_end.rest);
             } else {
-                try out.appendSlice(self.allocator, doc_end.rest);
+                try b.appendSlice(doc_end.rest);
             }
         }
         prev_line_no = line.line_no;
         self.index += 1;
-        if (truncateAtClosingQuote(&out, quote)) break;
+        if (truncateAtClosingQuoteBuilder(self, &b, quote)) break;
     }
 
-    if (!hasClosingQuote(out.items, quote)) return Error.Parse.UnterminatedString;
-    return out.toOwnedSlice(self.allocator);
+    if (!hasClosingQuote(b.itemsMut(), quote)) return Error.Parse.UnterminatedString;
+    return b.finish();
 }
 
 fn collectMultilineQuotedValue(self: *Parser, base_indent: usize, initial: []const u8, style: Token.ScalarStyle) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    defer out.deinit(self.allocator);
+    var b = ScalarBuilder.init(self);
+    defer b.deinit();
 
     const quote: u8 = if (style == .double_quoted) '"' else '\'';
-    try out.appendSlice(self.allocator, initial);
+    try b.appendSlice(initial);
     var prev_line_no = self.scanned.lines.items[self.index].line_no;
     self.index += 1;
 
-    while (self.index < self.scanned.lines.items.len and !hasClosingQuote(out.items, quote)) {
+    while (self.index < self.scanned.lines.items.len and !hasClosingQuote(b.itemsMut(), quote)) {
         const line = self.scanned.lines.items[self.index];
         if (line.kind == .document_end or line.kind == .empty_document) break;
         // A mapping or sequence value must continue past the parent's column
@@ -2030,35 +2119,35 @@ fn collectMultilineQuotedValue(self: *Parser, base_indent: usize, initial: []con
 
         const gap = if (line.line_no > prev_line_no) line.line_no - prev_line_no - 1 else 0;
 
-        stripTrailingQuoteWs(&out, style);
+        stripTrailingQuoteWsBuilder(&b, style);
 
-        if (style == .double_quoted and hasTrailingEscapedNewline(out.items)) {
-            _ = out.pop();
+        if (style == .double_quoted and hasTrailingEscapedNewline(b.itemsMut())) {
+            _ = b.pop();
             const trimmed = std.mem.trimStart(u8, line.value, " \t");
-            try out.appendSlice(self.allocator, trimmed);
+            try b.appendSlice(trimmed);
         } else {
             const trimmed = std.mem.trimStart(u8, std.mem.trim(u8, line.value, " \t"), " \t");
             const doc_end = trimDocEndLine(trimmed, style);
             if (gap > 0) {
                 var g: usize = 0;
-                while (g < gap) : (g += 1) try out.append(self.allocator, '\n');
+                while (g < gap) : (g += 1) try b.appendByte('\n');
             } else {
-                try out.append(self.allocator, ' ');
+                try b.appendByte(' ');
             }
             if (doc_end.prefix.len > 0) {
-                try out.appendSlice(self.allocator, doc_end.prefix);
-                try out.appendSlice(self.allocator, doc_end.rest);
+                try b.appendSlice(doc_end.prefix);
+                try b.appendSlice(doc_end.rest);
             } else {
-                try out.appendSlice(self.allocator, doc_end.rest);
+                try b.appendSlice(doc_end.rest);
             }
         }
         prev_line_no = line.line_no;
         self.index += 1;
-        if (truncateAtClosingQuote(&out, quote)) break;
+        if (truncateAtClosingQuoteBuilder(self, &b, quote)) break;
     }
 
-    if (!hasClosingQuote(out.items, quote)) return Error.Parse.UnterminatedString;
-    return out.toOwnedSlice(self.allocator);
+    if (!hasClosingQuote(b.itemsMut(), quote)) return Error.Parse.UnterminatedString;
+    return b.finish();
 }
 
 /// A quoted scalar may close before a trailing comment (`quotes" # lala`).
@@ -2066,6 +2155,39 @@ fn truncateAtClosingQuote(out: *std.ArrayListUnmanaged(u8), quote: u8) bool {
     const end = closingQuoteIndex(out.items, quote) orelse return false;
     if (end + 1 < out.items.len) out.shrinkRetainingCapacity(end + 1);
     return true;
+}
+
+fn truncateAtClosingQuoteBuilder(self: *Parser, b: *ScalarBuilder, quote: u8) bool {
+    const items = b.itemsMut();
+    const end = closingQuoteIndex(items, quote) orelse return false;
+    const keep = end + 1;
+    if (keep >= items.len) return true;
+    if (b.use_pool) {
+        const pool = self.scalar_pool.?;
+        pool.scratch.shrinkRetainingCapacity(b.pool_start + keep);
+    } else {
+        b.fallback.shrinkRetainingCapacity(keep);
+    }
+    return true;
+}
+
+fn stripTrailingQuoteWsBuilder(b: *ScalarBuilder, style: Token.ScalarStyle) void {
+    while (b.len() > 0) {
+        const items = b.itemsMut();
+        if (items[items.len - 1] != ' ' and items[items.len - 1] != '\t') break;
+        if (style == .double_quoted and items.len >= 2) {
+            var bs_count: usize = 0;
+            var j = items.len - 2;
+            while (true) {
+                if (items[j] != '\\') break;
+                bs_count += 1;
+                if (j == 0) break;
+                j -= 1;
+            }
+            if (bs_count % 2 == 1) break;
+        }
+        _ = b.pop();
+    }
 }
 
 fn closingQuoteIndex(text: []const u8, quote: u8) ?usize {
@@ -2255,7 +2377,7 @@ fn pushScalar(self: *Parser, value: []const u8, style: Token.ScalarStyle, anchor
         .data = .{ .scalar = .{
             .value = stored,
             .style = style,
-            .anchor = if (anchor) |a| try self.allocator.dupe(u8, a) else null,
+            .anchor = if (anchor) |a| try self.persistName(a) else null,
             .span = span,
             .value_owned = !borrow,
         } },
@@ -2290,12 +2412,21 @@ fn pushScalarOwned(self: *Parser, value: []const u8, style: Token.ScalarStyle, a
         .data = .{ .scalar = .{
             .value = value,
             .style = style,
-            .anchor = if (anchor) |a| try self.allocator.dupe(u8, a) else null,
+            .anchor = if (anchor) |a| try self.persistName(a) else null,
             .span = span,
             .value_owned = value.len > 0,
-            .pool_backed = value.len > 0 and self.scalar_pool_backed,
+            .pool_backed = self.scalarPoolOwns(value),
         } },
     });
+}
+
+fn scalarPoolOwns(self: *Parser, value: []const u8) bool {
+    if (value.len == 0) return false;
+    if (self.valueInScalarPool(value)) return true;
+    if (!self.scalar_pool_backed) return false;
+    if (isSubslice(self.scanned.source, value)) return false;
+    // Other owned parser buffers on the streaming path use `scalar_allocator` (pool arena).
+    return true;
 }
 
 /// Normalize then push, skipping the GPA copy for plain scalars that already
@@ -2317,6 +2448,10 @@ fn pushScalarNormalized(
             try self.pushScalar(trimmed, .plain, anchor, span);
             return;
         }
+        if (self.valueInScalarPool(trimmed)) {
+            try self.pushScalarOwned(@constCast(trimmed), .plain, anchor, span);
+            return;
+        }
         const owned = try self.scalar_allocator.dupe(u8, trimmed);
         try self.pushScalarOwned(owned, .plain, anchor, span);
         return;
@@ -2326,6 +2461,8 @@ fn pushScalarNormalized(
         if (std.mem.indexOf(u8, inner, "''") == null) {
             if (isSubslice(self.scanned.source, inner)) {
                 try self.pushScalar(inner, style, anchor, span);
+            } else if (self.valueInScalarPool(inner)) {
+                try self.pushScalarOwned(@constCast(inner), style, anchor, span);
             } else {
                 const owned = try self.scalar_allocator.dupe(u8, inner);
                 try self.pushScalarOwned(owned, style, anchor, span);
@@ -2338,6 +2475,8 @@ fn pushScalarNormalized(
         if (std.mem.indexOfScalar(u8, inner, '\\') == null) {
             if (isSubslice(self.scanned.source, inner)) {
                 try self.pushScalar(inner, style, anchor, span);
+            } else if (self.valueInScalarPool(inner)) {
+                try self.pushScalarOwned(@constCast(inner), style, anchor, span);
             } else {
                 const owned = try self.scalar_allocator.dupe(u8, inner);
                 try self.pushScalarOwned(owned, style, anchor, span);
@@ -2355,6 +2494,33 @@ fn isSubslice(haystack: []const u8, needle: []const u8) bool {
     const h_start = @intFromPtr(haystack.ptr);
     const h_end = h_start + haystack.len;
     return n_start >= h_start and n_start + needle.len <= h_end;
+}
+
+/// Borrow anchor/alias names that already live in the scanned source.
+fn persistName(self: *Parser, name: []const u8) ![]const u8 {
+    if (name.len == 0) return name;
+    if (isSubslice(self.scanned.source, name)) return name;
+    return try self.allocator.dupe(u8, name);
+}
+
+fn freeNameIfOwned(self: *Parser, name: []const u8) void {
+    if (name.len == 0) return;
+    if (isSubslice(self.scanned.source, name)) return;
+    self.allocator.free(name);
+}
+
+fn valueInScalarPool(self: *Parser, value: []const u8) bool {
+    const pool = self.scalar_pool orelse return false;
+    return isSubslice(pool.scratch.items, value);
+}
+
+/// Free a parser-rebuilt scalar buffer not consumed by the event stream.
+fn releaseTempScalar(self: *Parser, value: []const u8) void {
+    if (value.len == 0) return;
+    if (isSubslice(self.scanned.source, value)) return;
+    // Streaming parse retains rebuilt scalars in `OwnedScalarPool` until the document is dropped.
+    if (self.scalar_pool != null) return;
+    self.allocator.free(value);
 }
 
 fn pushSimple(self: *Parser, kind: EventModel.Kind, span: @import("Span.zig")) anyerror!void {

@@ -58,7 +58,10 @@ pub fn resolveScalarInDocument(
             pin: ?[]const u8,
         ) !Node {
             if (pin) |p| return .{ .string = @constCast(p) };
-            if (owned and pool) return .{ .string = @constCast(v) };
+            if (owned and pool) {
+                const s = try alloc.dupe(u8, v);
+                return .{ .string = s };
+            }
             if (owned) {
                 if (ev_gpa) |gpa| {
                     const s = try alloc.dupe(u8, v);
