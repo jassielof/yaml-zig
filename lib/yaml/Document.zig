@@ -8,17 +8,24 @@ pub const Document = @This();
 /// so borrowed scalar slices stay valid without per-document full-file dupes.
 pub const SharedPin = struct {
     allocator: std.mem.Allocator,
+    /// Logical input bytes (same length as the scanned source when owned).
     bytes: []const u8,
+    /// Owned allocation including compaction slack; null when borrowed.
+    backing: ?[]u8 = null,
     refs: usize,
     owns_bytes: bool,
 
     pub fn create(allocator: std.mem.Allocator, source: []const u8) !*SharedPin {
         const pin = try allocator.create(SharedPin);
         errdefer allocator.destroy(pin);
-        const bytes = try allocator.dupe(u8, source);
+        // Extra tail room for in-place literal block compaction (strip chomp may add then remove `\n`).
+        const slack = @max(@as(usize, 4096), source.len / 16);
+        const backing = try allocator.alloc(u8, source.len + slack);
+        @memcpy(backing[0..source.len], source);
         pin.* = .{
             .allocator = allocator,
-            .bytes = bytes,
+            .bytes = backing[0..source.len],
+            .backing = backing,
             .refs = 0,
             .owns_bytes = true,
         };
@@ -31,10 +38,16 @@ pub const SharedPin = struct {
         pin.* = .{
             .allocator = allocator,
             .bytes = source,
+            .backing = null,
             .refs = 0,
             .owns_bytes = false,
         };
         return pin;
+    }
+
+    pub fn mutableBacking(self: *SharedPin) ?[]u8 {
+        if (!self.owns_bytes) return null;
+        return self.backing;
     }
 
     pub fn retain(self: *SharedPin) void {
@@ -45,7 +58,7 @@ pub const SharedPin = struct {
         if (self.refs > 0) self.refs -= 1;
         if (self.refs == 0) {
             const allocator = self.allocator;
-            if (self.owns_bytes) allocator.free(@constCast(self.bytes));
+            if (self.backing) |b| allocator.free(b);
             allocator.destroy(self);
         }
     }
@@ -55,6 +68,8 @@ pub const SharedPin = struct {
 pub const OwnedScalarPool = struct {
     parent: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
+    /// Bump buffer for block/literal scalars (one growable slab per parse).
+    scratch: std.ArrayListUnmanaged(u8) = .empty,
     refs: usize,
 
     pub fn create(parent: std.mem.Allocator) !*OwnedScalarPool {
@@ -62,9 +77,22 @@ pub const OwnedScalarPool = struct {
         pool.* = .{
             .parent = parent,
             .arena = std.heap.ArenaAllocator.init(parent),
+            .scratch = .empty,
             .refs = 1,
         };
         return pool;
+    }
+
+    pub fn startScalar(self: *OwnedScalarPool) usize {
+        return self.scratch.items.len;
+    }
+
+    pub fn truncateScalar(self: *OwnedScalarPool, start: usize) void {
+        self.scratch.shrinkRetainingCapacity(start);
+    }
+
+    pub fn scalarSlice(self: *OwnedScalarPool, start: usize) []const u8 {
+        return self.scratch.items[start..];
     }
 
     pub fn retain(self: *OwnedScalarPool) void {
@@ -76,6 +104,7 @@ pub const OwnedScalarPool = struct {
         self.refs -= 1;
         if (self.refs == 0) {
             const parent = self.parent;
+            self.scratch.deinit(parent);
             self.arena.deinit();
             parent.destroy(self);
         }

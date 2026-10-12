@@ -74,7 +74,7 @@ pub fn composeStream(
                 try Document.SharedPin.createBorrowed(allocator, scan_source);
         }
         const pin = shared_pin.?;
-        const pinned_source = pin.bytes;
+        const pinned_source = pin.backing orelse pin.bytes;
 
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer _ = arena.deinit();
@@ -252,6 +252,7 @@ fn composeMappingKey(
     const key_bytes: []const u8 = blk: {
         if (!scalar.value_owned) {
             if (remapPinned(scan_source, pinned_source, trimmed)) |pin| break :blk pin;
+            if (isSubslice(pinned_source, trimmed)) break :blk trimmed;
         }
         break :blk try allocator.dupe(u8, trimmed);
     };
@@ -279,10 +280,11 @@ fn resolveEventScalar(
         return resolveTaggedScalar(doc_allocator, tag, scalar.value);
     }
 
-    const pinned = if (!scalar.value_owned)
-        remapPinned(scan_source, pinned_source, scalar.value)
-    else
-        null;
+    const pinned = if (!scalar.value_owned) blk: {
+        if (remapPinned(scan_source, pinned_source, scalar.value)) |p| break :blk p;
+        if (isSubslice(pinned_source, scalar.value)) break :blk scalar.value;
+        break :blk null;
+    } else null;
 
     const node = try Schema.resolveScalarInDocument(
         doc_allocator,
@@ -531,7 +533,14 @@ pub const Stream = struct {
     }
 
     fn pinnedSource(self: *Stream) []const u8 {
-        return self.shared_pin.?.bytes;
+        const pin = self.shared_pin.?;
+        return pin.backing orelse pin.bytes;
+    }
+
+    /// Writable copy of the input when `retain_input` is true (block scalars compact in-place).
+    pub fn mutablePinnedBytes(self: *Stream) ?[]u8 {
+        const pin = self.shared_pin orelse return null;
+        return pin.mutableBacking();
     }
 
     fn keepAnchorName(self: *Stream, anchor: ?[]const u8) !?[]const u8 {

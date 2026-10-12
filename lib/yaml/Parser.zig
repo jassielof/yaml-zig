@@ -196,7 +196,7 @@ fn parseBlockValue(self: *Parser, indent: usize, is_root: bool) anyerror!void {
 
     if (line.kind == .scalar and (line.style == .literal or line.style == .folded)) {
         const block = try self.collectBlockScalar(line.indent, line.style, line.value, line.line_no);
-        try self.pushScalarOwned(block, line.style, null, line.span);
+        try self.pushBlockScalar(block, line.style, null, line.span);
         return;
     }
 
@@ -373,7 +373,7 @@ fn parseBlockSequence(self: *Parser, indent: usize) anyerror!void {
         // Block scalar value
         if (line.style == .literal or line.style == .folded) {
             const block = try self.collectBlockScalar(line.indent, line.style, line.value, line.line_no);
-            try self.pushScalarOwned(block, line.style, null, line.span);
+            try self.pushBlockScalar(block, line.style, null, line.span);
             continue;
         }
 
@@ -545,7 +545,7 @@ fn emitSequenceItemMapping(self: *Parser, line: Scanner.ScannedLine, seq_indent:
         const vs = detectInlineStyle(raw_val);
         if (vs == .literal or vs == .folded) {
             const block = try self.collectBlockScalar(seq_indent + 2, vs, raw_val, line.line_no);
-            try self.pushScalarOwned(block, vs, null, .{});
+            try self.pushBlockScalar(block, vs, null, .{});
         } else if (vs == .plain) {
             // Fold indented continuation lines into the plain value
             // (`- message: …\n    specified`).
@@ -774,7 +774,7 @@ fn emitSingleMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_inden
                                 const nn = self.scanned.lines.items[self.index];
                                 if (nn.kind == .scalar and (nn.style == .literal or nn.style == .folded)) {
                                     const block = try self.collectBlockScalar(parent_indent, nn.style, nn.value, nn.line_no);
-                                    try self.pushScalarOwned(block, nn.style, nv_anchor, line.span);
+                                    try self.pushBlockScalar(block, nn.style, nv_anchor, line.span);
                                     return;
                                 }
                                 if (nv_anchor) |anch| {
@@ -885,7 +885,7 @@ fn emitSingleMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_inden
 
     if (line.style == .literal or line.style == .folded) {
         const block = try self.collectBlockScalar(line.indent, line.style, line.value, line.line_no);
-        try self.pushScalarOwned(block, line.style, null, line.span);
+        try self.pushBlockScalar(block, line.style, null, line.span);
         return;
     }
 
@@ -897,7 +897,7 @@ fn emitSingleMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_inden
         if (trimmed_after.len > 0 and (trimmed_after[0] == '|' or trimmed_after[0] == '>')) {
             const bs_style: Token.ScalarStyle = if (trimmed_after[0] == '|') .literal else .folded;
             const block = try self.collectBlockScalar(line.indent, bs_style, trimmed_after, line.line_no);
-            try self.pushScalarOwned(block, bs_style, null, line.span);
+            try self.pushBlockScalar(block, bs_style, null, line.span);
             return;
         }
     }
@@ -966,7 +966,7 @@ fn emitExplicitMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_ind
         const key_text = try self.collectExplicitKey(line, parent_indent);
         const key_style = line.key_style;
         if (key_style == .literal or key_style == .folded) {
-            try self.pushScalarOwned(key_text, key_style, null, line.span);
+            try self.pushBlockScalar(key_text, key_style, null, line.span);
         } else {
             defer self.allocator.free(key_text);
             if (key_style == .plain) {
@@ -1002,7 +1002,7 @@ fn emitExplicitMappingEntry(self: *Parser, line: Scanner.ScannedLine, parent_ind
     if (value_style == .literal or value_style == .folded) {
         self.index -= 1;
         const block = try self.collectBlockScalar(parent_indent, value_style, value_text, value_line_no);
-        try self.pushScalarOwned(block, value_style, null, value_span);
+        try self.pushBlockScalar(block, value_style, null, value_span);
         return;
     }
 
@@ -1111,6 +1111,88 @@ fn isCompactSequence(text: []const u8) bool {
     return text.len >= 1 and text[0] == '-' and (text.len == 1 or text[1] == ' ' or text[1] == '\t');
 }
 
+fn mutablePinBytes(self: *Parser) ?[]u8 {
+    if (!self.options.retain_input) return null;
+    const st = self.stream orelse return null;
+    return st.mutablePinnedBytes();
+}
+
+fn sourceOffset(source: []const u8, slice: []const u8) usize {
+    return @intFromPtr(slice.ptr) - @intFromPtr(source.ptr);
+}
+
+fn appendLiteralBlockLine(
+    pin: ?[]u8,
+    pin_write: *usize,
+    pool: ?*@import("Document.zig").OwnedScalarPool,
+    rline: []const u8,
+    li: usize,
+    bi: usize,
+    has_content: bool,
+) !void {
+    if (li >= rline.len) {
+        if (has_content and li > bi) {
+            const slice = rline[bi..];
+            if (pin) |p| {
+                @memcpy(p[pin_write.* .. pin_write.* + slice.len], slice);
+                pin_write.* += slice.len;
+                p[pin_write.*] = '\n';
+                pin_write.* += 1;
+            } else if (pool) |pl| {
+                try pl.scratch.appendSlice(pl.parent, slice);
+                try pl.scratch.append(pl.parent, '\n');
+            }
+        } else if (pin) |p| {
+            p[pin_write.*] = '\n';
+            pin_write.* += 1;
+        } else if (pool) |pl| {
+            try pl.scratch.append(pl.parent, '\n');
+        }
+        return;
+    }
+    if (li >= bi) {
+        const slice = rline[bi..];
+        if (pin) |p| {
+            @memcpy(p[pin_write.* .. pin_write.* + slice.len], slice);
+            pin_write.* += slice.len;
+            p[pin_write.*] = '\n';
+            pin_write.* += 1;
+        } else if (pool) |pl| {
+            try pl.scratch.appendSlice(pl.parent, slice);
+            try pl.scratch.append(pl.parent, '\n');
+        }
+    } else if (pin) |p| {
+        p[pin_write.*] = '\n';
+        pin_write.* += 1;
+    } else if (pool) |pl| {
+        try pl.scratch.append(pl.parent, '\n');
+    }
+}
+
+fn finishLiteralBlockChomp(
+    buf: []u8,
+    start: usize,
+    end: usize,
+    has_content: bool,
+    chomp: ChompMode,
+) []const u8 {
+    var len = end - start;
+    switch (chomp) {
+        .strip => {
+            while (len > 0 and buf[start + len - 1] == '\n') len -= 1;
+        },
+        .clip => {
+            while (len > 0 and buf[start + len - 1] == '\n') len -= 1;
+            if (has_content) {
+                buf[start + len] = '\n';
+                len += 1;
+            }
+        },
+        .keep => {},
+    }
+    return buf[start .. start + len];
+}
+
 fn collectBlockScalar(
     self: *Parser,
     parent_indent: usize,
@@ -1142,6 +1224,15 @@ fn collectBlockScalar(
     var sole_content_ri: usize = 0;
     var content_lines: usize = 0;
     var leading_blanks: usize = 0;
+
+    const literal_pool: ?*@import("Document.zig").OwnedScalarPool = if (style == .literal and self.stream != null)
+        self.stream.?.scalar_pool
+    else
+        null;
+    var literal_pool_start: usize = 0;
+    const pin_buf: ?[]u8 = if (style == .literal) self.mutablePinBytes() else null;
+    var pin_write_start: usize = 0;
+    var pin_write: usize = 0;
 
     {
         var ri = header_line_no + 1;
@@ -1197,15 +1288,75 @@ fn collectBlockScalar(
 
     const bi = base_indent orelse (parent_indent + 1);
 
+    var literal_filled = false;
+    if (style == .literal and leading_blanks == 0 and (pin_buf != null or literal_pool != null)) {
+        if (literal_pool) |pl| literal_pool_start = pl.startScalar();
+        var ri = header_line_no + 1;
+        while (ri < block_end) : (ri += 1) {
+            const rline = raw_lines[ri].text;
+            const li = raw_lines[ri].spaces;
+            if (pin_buf != null and pin_write == pin_write_start and li < rline.len and li >= bi) {
+                const slice = rline[bi..];
+                pin_write_start = sourceOffset(self.scanned.source, slice);
+                pin_write = pin_write_start;
+            }
+            try appendLiteralBlockLine(
+                pin_buf,
+                &pin_write,
+                literal_pool,
+                rline,
+                li,
+                bi,
+                has_content,
+            );
+        }
+        literal_filled = true;
+    }
+
     // `|-` with exactly one content line and nothing after it (no trailing blanks that
     // strip would still partially keep when more-indented). Leading blanks disallowed.
     if (style == .literal and chomp == .strip and content_lines == 1 and leading_blanks == 0 and
         block_end == sole_content_ri + 1)
     {
-        if (sole_content) |content| return try self.scalar_allocator.dupe(u8, content);
+        if (sole_content) |content| {
+            if (literal_pool) |pl| pl.truncateScalar(literal_pool_start);
+            if (self.pinBorrowSlice(content)) |borrowed| return @constCast(borrowed);
+            if (literal_pool) |pl| {
+                const s = pl.startScalar();
+                try pl.scratch.appendSlice(pl.parent, content);
+                return @constCast(pl.scalarSlice(s));
+            }
+            return try self.scalar_allocator.dupe(u8, content);
+        }
     }
 
     if (style == .literal) {
+        if (literal_filled) {
+            if (pin_buf) |pin| {
+                return @constCast(finishLiteralBlockChomp(pin, pin_write_start, pin_write, has_content, chomp));
+            }
+            if (literal_pool) |pl| {
+                const start = literal_pool_start;
+                var len = pl.scratch.items.len - start;
+                const buf = pl.scratch.items;
+                switch (chomp) {
+                    .strip => {
+                        while (len > 0 and buf[start + len - 1] == '\n') len -= 1;
+                    },
+                    .clip => {
+                        while (len > 0 and buf[start + len - 1] == '\n') len -= 1;
+                        pl.truncateScalar(start + len);
+                        if (has_content) try pl.scratch.append(pl.parent, '\n');
+                        return @constCast(pl.scalarSlice(start));
+                    },
+                    .keep => {},
+                }
+                pl.truncateScalar(start + len);
+                return @constCast(pl.scalarSlice(start));
+            }
+        } else if (literal_pool) |pl| {
+            pl.truncateScalar(literal_pool_start);
+        }
         return try collectLiteralBlock(
             self.scalar_allocator,
             raw_lines,
@@ -2075,6 +2226,16 @@ fn isSpace(c: u8) bool {
     return c == ' ' or c == '\t' or c == '\n' or c == '\r';
 }
 
+fn pinBorrowSlice(self: *Parser, source_slice: []const u8) ?[]const u8 {
+    const st = self.stream orelse return null;
+    const pin = st.shared_pin orelse return null;
+    if (source_slice.len == 0) return pin.bytes[0..0];
+    if (!isSubslice(self.scanned.source, source_slice)) return null;
+    const off = sourceOffset(self.scanned.source, source_slice);
+    if (off + source_slice.len > pin.bytes.len) return null;
+    return pin.bytes[off .. off + source_slice.len];
+}
+
 fn pushDocumentStart(self: *Parser, explicit: bool) anyerror!void {
     try self.emitEvent(.{
         .kind = .document_start,
@@ -2099,6 +2260,27 @@ fn pushScalar(self: *Parser, value: []const u8, style: Token.ScalarStyle, anchor
             .value_owned = !borrow,
         } },
     });
+}
+
+/// Push a GPA-allocated scalar buffer; ownership transfers to the event stream.
+fn blockScalarIsBorrowed(self: *Parser, value: []const u8) bool {
+    if (value.len == 0) return true;
+    if (isSubslice(self.scanned.source, value)) return true;
+    if (self.stream) |st| {
+        if (st.shared_pin) |pin| {
+            if (isSubslice(pin.bytes, value)) return true;
+            if (pin.backing) |b| return isSubslice(b, value);
+        }
+    }
+    return false;
+}
+
+fn pushBlockScalar(self: *Parser, value: []const u8, style: Token.ScalarStyle, anchor: ?[]const u8, span: @import("Span.zig")) anyerror!void {
+    if (blockScalarIsBorrowed(self, value)) {
+        try self.pushScalar(value, style, anchor, span);
+    } else {
+        try self.pushScalarOwned(value, style, anchor, span);
+    }
 }
 
 /// Push a GPA-allocated scalar buffer; ownership transfers to the event stream.
