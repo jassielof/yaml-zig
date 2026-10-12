@@ -275,6 +275,18 @@ fn resolveEventScalar(
         return resolveTaggedScalar(doc_allocator, tag, scalar.value);
     }
 
+    if (scalar.style == .plain and
+        (!options.resolve_core_schema or !Schema.plainScalarNeedsCoreResolution(scalar.value)))
+    {
+        return finishPlainStringNode(
+            doc_allocator,
+            event_gpa,
+            scalar,
+            scan_source,
+            pinned_source,
+        );
+    }
+
     const pinned = if (!scalar.value_owned) blk: {
         if (remapPinned(scan_source, pinned_source, scalar.value)) |p| break :blk p;
         if (isSubslice(pinned_source, scalar.value)) break :blk scalar.value;
@@ -295,6 +307,33 @@ fn resolveEventScalar(
         scalar.value_owned = false;
     }
     return node;
+}
+
+fn finishPlainStringNode(
+    doc_allocator: std.mem.Allocator,
+    event_gpa: std.mem.Allocator,
+    scalar: *Event.Scalar,
+    scan_source: []const u8,
+    pinned_source: []const u8,
+) !Node {
+    if (!scalar.value_owned) {
+        if (remapPinned(scan_source, pinned_source, scalar.value)) |p| {
+            return .{ .string = @constCast(p) };
+        }
+        if (isSubslice(pinned_source, scalar.value)) {
+            return .{ .string = @constCast(scalar.value) };
+        }
+    }
+    if (scalar.pool_backed) {
+        return .{ .string = try doc_allocator.dupe(u8, scalar.value) };
+    }
+    if (scalar.value_owned) {
+        const s = try doc_allocator.dupe(u8, scalar.value);
+        event_gpa.free(scalar.value);
+        scalar.value_owned = false;
+        return .{ .string = s };
+    }
+    return .{ .string = try doc_allocator.dupe(u8, scalar.value) };
 }
 
 fn remapPinned(scan_source: []const u8, pinned_source: []const u8, value: []const u8) ?[]const u8 {

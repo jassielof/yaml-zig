@@ -50,12 +50,11 @@ pub const ScannedDocument = struct {
     lines: std.ArrayListUnmanaged(ScannedLine),
     /// Physical source lines (CR-stripped). Shared with the parser for block scalars.
     physical: std.ArrayListUnmanaged(PhysicalLine) = .empty,
-    /// Buffers for values joined across physical lines (multiline flow).
-    owned: std.ArrayListUnmanaged([]u8) = .empty,
+    /// Bump arena for multiline flow joins (freed in one shot in `deinit`).
+    join_arena: std.heap.ArenaAllocator,
 
     pub fn deinit(self: *ScannedDocument, allocator: std.mem.Allocator) void {
-        for (self.owned.items) |buf| allocator.free(buf);
-        self.owned.deinit(allocator);
+        _ = self.join_arena.deinit();
         self.physical.deinit(allocator);
         self.lines.deinit(allocator);
         self.* = undefined;
@@ -88,11 +87,9 @@ pub fn scan(self: *Scanner) !ScannedDocument {
 
     try self.lines.ensureTotalCapacity(self.allocator, physical.items.len);
 
-    var owned: std.ArrayListUnmanaged([]u8) = .empty;
-    errdefer {
-        for (owned.items) |buf| self.allocator.free(buf);
-        owned.deinit(self.allocator);
-    }
+    var join_arena = std.heap.ArenaAllocator.init(self.allocator);
+    errdefer join_arena.deinit();
+    const join_a = join_arena.allocator();
 
     var line_no: usize = 0;
     var emitted_in_doc = false;
@@ -203,7 +200,7 @@ pub fn scan(self: *Scanner) !ScannedDocument {
                 ""
             else
                 stripInlineComment(std.mem.trimStart(u8, content[2..], " \t"));
-            const sequence_value = try joinUnclosedFlow(self.allocator, physical.items, &line_no, sequence_raw, &owned, indent, false);
+            const sequence_value = try joinUnclosedFlow(join_a, physical.items, &line_no, sequence_raw, indent, false);
             const sequence_style = detectStyle(sequence_value);
             try ensureBlockHeader(sequence_style, sequence_value);
             try self.lines.append(self.allocator, .{
@@ -229,7 +226,7 @@ pub fn scan(self: *Scanner) !ScannedDocument {
             const key_head = std.mem.trimStart(u8, commented, " \t");
             const opens_flow = key_head.len > 0 and (key_head[0] == '[' or key_head[0] == '{');
             const real_key = if (opens_flow)
-                try joinUnclosedFlow(self.allocator, physical.items, &line_no, commented, &owned, indent, false)
+                try joinUnclosedFlow(join_a, physical.items, &line_no, commented, indent, false)
             else
                 commented;
             const key_style = if (real_key.len > 0) detectStyle(real_key) else .plain;
@@ -259,7 +256,7 @@ pub fn scan(self: *Scanner) !ScannedDocument {
                     ""
                 else
                     stripInlineComment(std.mem.trimStart(u8, content[2..], " \t"));
-                const value = try joinUnclosedFlow(self.allocator, physical.items, &line_no, raw_value, &owned, indent, false);
+                const value = try joinUnclosedFlow(join_a, physical.items, &line_no, raw_value, indent, false);
                 const value_style = detectStyle(value);
                 try ensureBlockHeader(value_style, value);
                 try self.lines.append(self.allocator, .{
@@ -281,7 +278,7 @@ pub fn scan(self: *Scanner) !ScannedDocument {
                 ""
             else
                 stripInlineComment(std.mem.trimStart(u8, content[2..], " \t"));
-            const value = try joinUnclosedFlow(self.allocator, physical.items, &line_no, raw_value, &owned, indent, false);
+            const value = try joinUnclosedFlow(join_a, physical.items, &line_no, raw_value, indent, false);
             const value_style = detectStyle(value);
             try ensureBlockHeader(value_style, value);
             try self.lines.append(self.allocator, .{
@@ -301,7 +298,7 @@ pub fn scan(self: *Scanner) !ScannedDocument {
             const key = std.mem.trim(u8, content[0..idx], " \t");
             if (key.len == 0) return Error.Parse.InvalidMappingKey;
             const raw_value = stripInlineComment(std.mem.trimStart(u8, content[idx + 1 ..], " \t"));
-            const value = try joinUnclosedFlow(self.allocator, physical.items, &line_no, raw_value, &owned, indent, false);
+            const value = try joinUnclosedFlow(join_a, physical.items, &line_no, raw_value, indent, false);
             const value_style = detectStyle(value);
             const key_style = detectStyle(key);
             try ensureBlockHeader(key_style, key);
@@ -327,7 +324,7 @@ pub fn scan(self: *Scanner) !ScannedDocument {
 
         const flow_head = std.mem.trimStart(u8, content, " \t");
         const flow_opens_line = !from_marker and flow_head.len > 0 and (flow_head[0] == '[' or flow_head[0] == '{');
-        const scalar_value = try joinUnclosedFlow(self.allocator, physical.items, &line_no, content, &owned, indent, flow_opens_line);
+        const scalar_value = try joinUnclosedFlow(join_a, physical.items, &line_no, content, indent, flow_opens_line);
         var scalar_style = detectStyle(scalar_value);
         // Bare lines such as `| zone1 |` or `>= v1.2"` are plain content, not
         // block-scalar headers. Invalid header *attempts* (`|0`, `|10`) still error.
@@ -358,19 +355,25 @@ pub fn scan(self: *Scanner) !ScannedDocument {
         .source = self.source,
         .lines = result_lines,
         .physical = physical,
-        .owned = owned,
+        .join_arena = join_arena,
     };
 }
 
 pub fn tokenizeFlow(
-    allocator: std.mem.Allocator,
+    list_allocator: std.mem.Allocator,
+    scratch_allocator: std.mem.Allocator,
     text: []const u8,
     line_no: usize,
     column_base: usize,
     folded: *std.ArrayListUnmanaged([]u8),
+    reuse: ?*std.ArrayListUnmanaged(TokenModel.Token),
 ) ![]TokenModel.Token {
-    var out: std.ArrayListUnmanaged(TokenModel.Token) = .empty;
-    defer out.deinit(allocator);
+    const allocator = list_allocator;
+    const scratch = scratch_allocator;
+    var local: std.ArrayListUnmanaged(TokenModel.Token) = .empty;
+    const out = reuse orelse &local;
+    if (reuse != null) reuse.?.clearRetainingCapacity();
+    errdefer if (reuse == null) local.deinit(allocator);
 
     var i: usize = 0;
     // True after a quoted scalar until the next token. `:` then separates even
@@ -421,7 +424,7 @@ pub fn tokenizeFlow(
                 if (!isFlowValueColon(text, i) and !json_key_ready) {
                     const start = i;
                     i = nextPlainEnd(text, start + 1);
-                    const lexeme = try plainFlowLexeme(allocator, text[start..i], folded);
+                    const lexeme = try plainFlowLexeme(scratch, allocator, text[start..i], folded);
                     if (lexeme.len == 0) continue;
                     json_key_ready = false;
                     try out.append(allocator, .{
@@ -481,7 +484,7 @@ pub fn tokenizeFlow(
                 }
                 const start = i;
                 i = nextPlainEnd(text, start);
-                const lexeme = try plainFlowLexeme(allocator, text[start..i], folded);
+                const lexeme = try plainFlowLexeme(scratch, allocator, text[start..i], folded);
                 if (lexeme.len == 0) continue;
                 json_key_ready = false;
                 try out.append(allocator, .{
@@ -542,7 +545,7 @@ pub fn tokenizeFlow(
                 const content = text[content_start..i];
                 i += 1;
                 const lexeme = if (std.mem.indexOfAny(u8, content, "\n\r") != null)
-                    try foldFlowQuoted(allocator, content, folded)
+                    try foldFlowQuoted(scratch, allocator, content, folded)
                 else
                     content;
                 try out.append(allocator, .{
@@ -559,7 +562,7 @@ pub fn tokenizeFlow(
             else => {
                 const start = i;
                 i = nextPlainEnd(text, start);
-                const lexeme = try plainFlowLexeme(allocator, text[start..i], folded);
+                const lexeme = try plainFlowLexeme(scratch, allocator, text[start..i], folded);
                 if (lexeme.len == 0) continue;
                 json_key_ready = false;
                 try out.append(allocator, .{
@@ -577,6 +580,7 @@ pub fn tokenizeFlow(
     }
 
     try out.append(allocator, .{ .kind = .eof, .span = makeSpan(line_no, column_base + text.len, column_base + text.len) });
+    if (reuse != null) return out.items;
     return out.toOwnedSlice(allocator);
 }
 
@@ -1019,19 +1023,18 @@ fn hasInlineComment(text: []const u8) bool {
 }
 
 fn joinUnclosedFlow(
-    allocator: std.mem.Allocator,
+    join_allocator: std.mem.Allocator,
     lines: []const PhysicalLine,
     index: *usize,
     initial: []const u8,
-    owned: *std.ArrayListUnmanaged([]u8),
     parent_indent: usize,
     opener_at_line_start: bool,
 ) ![]const u8 {
     if (!flowUnclosed(initial)) return initial;
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer buf.deinit(allocator);
-    try buf.appendSlice(allocator, initial);
+    errdefer buf.deinit(join_allocator);
+    try buf.appendSlice(join_allocator, initial);
 
     // Only a value that itself opens a flow collection is indentation-sensitive
     // (`flow: [a,\nb]`). A `{` inside later plain or block text is not a flow node.
@@ -1051,18 +1054,16 @@ fn joinUnclosedFlow(
         if (enforce_indent and cont_text.len != 0 and (lines[i].spaces < min_indent or tabBeforeColumn(cont, min_indent))) {
             return Error.Parse.InvalidIndentation;
         }
-        try buf.append(allocator, '\n');
-        try buf.appendSlice(allocator, cont);
+        try buf.append(join_allocator, '\n');
+        try buf.appendSlice(join_allocator, cont);
     }
     if (i == index.* + 1) {
-        buf.deinit(allocator);
+        buf.deinit(join_allocator);
         return initial;
     }
 
     index.* = i - 1;
-    const slice = try buf.toOwnedSlice(allocator);
-    try owned.append(allocator, slice);
-    return slice;
+    return try buf.toOwnedSlice(join_allocator);
 }
 
 fn stripInlineComment(text: []const u8) []const u8 {
@@ -1113,14 +1114,19 @@ fn stripInlineComment(text: []const u8) []const u8 {
     return std.mem.trimStart(u8, text, " \t");
 }
 
-fn foldFlowQuoted(allocator: std.mem.Allocator, inner: []const u8, folded: *std.ArrayListUnmanaged([]u8)) ![]const u8 {
+fn foldFlowQuoted(
+    scratch: std.mem.Allocator,
+    list: std.mem.Allocator,
+    inner: []const u8,
+    folded: *std.ArrayListUnmanaged([]u8),
+) ![]const u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
+    errdefer out.deinit(scratch);
 
     var i: usize = 0;
     while (i < inner.len) {
         if (inner[i] != '\n' and inner[i] != '\r') {
-            try out.append(allocator, inner[i]);
+            try out.append(scratch, inner[i]);
             i += 1;
             continue;
         }
@@ -1134,16 +1140,15 @@ fn foldFlowQuoted(allocator: std.mem.Allocator, inner: []const u8, folded: *std.
         while (i < inner.len and (inner[i] == ' ' or inner[i] == '\t')) i += 1;
 
         if (breaks <= 1) {
-            try out.append(allocator, ' ');
+            try out.append(scratch, ' ');
         } else {
             var extra: usize = 1;
-            while (extra < breaks) : (extra += 1) try out.append(allocator, '\n');
+            while (extra < breaks) : (extra += 1) try out.append(scratch, '\n');
         }
     }
 
-    const slice = try out.toOwnedSlice(allocator);
-    errdefer allocator.free(slice);
-    try folded.append(allocator, slice);
+    const slice = try out.toOwnedSlice(scratch);
+    try folded.append(list, slice);
     return slice;
 }
 
@@ -1170,14 +1175,15 @@ fn nextPlainEnd(text: []const u8, start: usize) usize {
 }
 
 fn plainFlowLexeme(
-    allocator: std.mem.Allocator,
+    scratch: std.mem.Allocator,
+    list: std.mem.Allocator,
     raw: []const u8,
     folded: *std.ArrayListUnmanaged([]u8),
 ) ![]const u8 {
     const lexeme = if (std.mem.indexOfAny(u8, raw, "\n\r") == null)
         std.mem.trim(u8, raw, " \t")
     else
-        std.mem.trim(u8, try foldFlowQuoted(allocator, raw, folded), " \t");
+        std.mem.trim(u8, try foldFlowQuoted(scratch, list, raw, folded), " \t");
     // A bare dash inside a flow collection is not a plain scalar (`[-]`, `[-, -]`).
     if (std.mem.eql(u8, lexeme, "-")) return Error.Parse.UnexpectedToken;
     return lexeme;

@@ -94,6 +94,10 @@ pub fn resolveScalarInDocument(
     }
 
     if (couldBeNumber(value)) {
+        if (tryQuickDecimalInt(value)) |v| {
+            release_owned(event_gpa, value, value_owned, pool_backed);
+            return .{ .int = v };
+        }
         if (parseInt(doc_allocator, value)) |v| {
             release_owned(event_gpa, value, value_owned, pool_backed);
             return .{ .int = v };
@@ -117,6 +121,18 @@ pub fn plainScalarNeedsCoreResolution(value: []const u8) bool {
 }
 
 /// Cheap gate before int/float parsing. Underscores and hex/oct prefixes are handled inside.
+/// Plain ASCII decimal integer (OpenAPI status codes, small ints) without schema extras.
+fn tryQuickDecimalInt(value: []const u8) ?i64 {
+    const text = std.mem.trim(u8, value, " ");
+    if (text.len == 0 or text.len > 19) return null;
+    var v: i64 = 0;
+    for (text) |c| {
+        if (c < '0' or c > '9') return null;
+        v = v * 10 + @as(i64, c - '0');
+    }
+    return v;
+}
+
 fn couldBeNumber(value: []const u8) bool {
     const text = std.mem.trim(u8, value, " ");
     if (text.len == 0) return false;

@@ -27,6 +27,8 @@ scalar_pool: ?*@import("Document.zig").OwnedScalarPool = null,
 stream: ?*Composer.Stream = null,
 emit_sink: EmitSink = .direct,
 flow_scratch: std.ArrayListUnmanaged(EventModel.Event) = .empty,
+flow_tokens: std.ArrayListUnmanaged(Token.Token) = .empty,
+flow_folded: std.ArrayListUnmanaged([]u8) = .empty,
 pending_scalar_tag: ?[]const u8 = null,
 events: std.ArrayListUnmanaged(EventModel.Event) = .empty,
 index: usize = 0,
@@ -60,6 +62,8 @@ pub fn deinit(self: *Parser) void {
     self.events.deinit(self.allocator);
     self.freeEventSlice(self.flow_scratch.items);
     self.flow_scratch.deinit(self.allocator);
+    self.flow_tokens.deinit(self.allocator);
+    self.flow_folded.deinit(self.allocator);
     self.scanned.deinit(self.allocator);
     self.* = undefined;
 }
@@ -107,6 +111,9 @@ fn runParseLoop(self: *Parser) !void {
         if (line_count > 0) {
             try self.events.ensureTotalCapacity(self.allocator, line_count * 4 + 32);
         }
+    } else if (self.scanned.source.len >= 512 * 1024) {
+        try self.flow_tokens.ensureTotalCapacity(self.allocator, 8192);
+        try self.flow_folded.ensureTotalCapacity(self.allocator, 256);
     }
 
     try self.pushSimple(.stream_start, .{});
@@ -1614,13 +1621,12 @@ fn parseFlow(self: *Parser, text: []const u8, line_no: usize, col: usize) anyerr
         if (self.stream != null) self.emit_sink = saved_sink;
     }
 
-    var folded: std.ArrayListUnmanaged([]u8) = .empty;
-    defer {
-        for (folded.items) |buf| self.allocator.free(buf);
-        folded.deinit(self.allocator);
-    }
-    const tokens = try Scanner.tokenizeFlow(self.allocator, text, line_no, col, &folded);
-    defer self.allocator.free(tokens);
+    const scratch_a: std.mem.Allocator = if (self.scalar_pool != null) self.scalar_allocator else self.allocator;
+    self.flow_folded.clearRetainingCapacity();
+    const tokens = try Scanner.tokenizeFlow(self.allocator, scratch_a, text, line_no, col, &self.flow_folded, &self.flow_tokens);
+    defer if (self.scalar_pool == null) {
+        for (self.flow_folded.items) |buf| self.allocator.free(buf);
+    };
     var cursor: usize = 0;
     const at = self.activeEventList().items.len;
     try self.parseFlowValue(tokens, &cursor);

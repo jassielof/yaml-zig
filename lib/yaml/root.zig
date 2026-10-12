@@ -95,7 +95,8 @@ pub fn parseStream(
     const scalar_pool = try Document.OwnedScalarPool.create(allocator);
     errdefer scalar_pool.release();
     if (scanned.source.len >= 512 * 1024) {
-        try scalar_pool.scratch.ensureTotalCapacity(scalar_pool.scratchAlloc(), @min(scanned.source.len / 2, 8 * 1024 * 1024));
+        const cap = @min(scanned.source.len + scanned.source.len / 4, 16 * 1024 * 1024);
+        try scalar_pool.scratch.ensureTotalCapacity(scalar_pool.scratchAlloc(), cap);
     }
     var stream = Composer.Stream.init(allocator, options, scanned.source, scalar_pool);
     errdefer stream.deinit();
